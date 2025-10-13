@@ -42,6 +42,7 @@ from lerobot.robots import (  # noqa: F401
     koch_follower,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.teleoperators import (  # noqa: F401
     TeleoperatorConfig,
@@ -49,6 +50,7 @@ from lerobot.teleoperators import (  # noqa: F401
     koch_leader,
     make_teleoperator_from_config,
     so100_leader,
+    so101_leader,
 )
 from lerobot.utils.robot_utils import busy_wait
 
@@ -77,17 +79,21 @@ def find_joint_and_ee_bounds(cfg: FindJointLimitsConfig):
         # Note to be compatible with the rest of the codebase,
         # we are using the new calibration method for so101 and so100
         robot_type = "so_new_calibration"
-    kinematics = RobotKinematics(cfg.robot.urdf_path, cfg.robot.target_frame_name)
+    kinematics = None
+    if hasattr(cfg.robot, 'urdf_path') and hasattr(cfg.robot, 'target_frame_name'):
+        kinematics = RobotKinematics(cfg.robot.urdf_path, cfg.robot.target_frame_name)
 
     # Initialize min/max values
     observation = robot.get_observation()
     joint_positions = np.array([observation[f"{key}.pos"] for key in robot.bus.motors])
-    ee_pos = kinematics.forward_kinematics(joint_positions)[:3, 3]
+    ee_pos = None
+    if kinematics is not None:
+        ee_pos = kinematics.forward_kinematics(joint_positions)[:3, 3]
 
     max_pos = joint_positions.copy()
     min_pos = joint_positions.copy()
-    max_ee = ee_pos.copy()
-    min_ee = ee_pos.copy()
+    max_ee = ee_pos.copy() if ee_pos is not None else None
+    min_ee = ee_pos.copy() if ee_pos is not None else None
 
     while True:
         action = teleop.get_action()
@@ -95,21 +101,25 @@ def find_joint_and_ee_bounds(cfg: FindJointLimitsConfig):
 
         observation = robot.get_observation()
         joint_positions = np.array([observation[f"{key}.pos"] for key in robot.bus.motors])
-        ee_pos = kinematics.forward_kinematics(joint_positions)[:3, 3]
+        ee_pos = None
+        if kinematics is not None:
+            ee_pos = kinematics.forward_kinematics(joint_positions)[:3, 3]
 
         # Skip initial warmup period
         if (time.perf_counter() - start_episode_t) < 5:
             continue
 
         # Update min/max values
-        max_ee = np.maximum(max_ee, ee_pos)
-        min_ee = np.minimum(min_ee, ee_pos)
+        if kinematics is not None and ee_pos is not None:
+            max_ee = np.maximum(max_ee, ee_pos)
+            min_ee = np.minimum(min_ee, ee_pos)
         max_pos = np.maximum(max_pos, joint_positions)
         min_pos = np.minimum(min_pos, joint_positions)
 
         if time.perf_counter() - start_episode_t > cfg.teleop_time_s:
-            print(f"Max ee position {np.round(max_ee, 4).tolist()}")
-            print(f"Min ee position {np.round(min_ee, 4).tolist()}")
+            if kinematics is not None:
+                print(f"Max ee position {np.round(max_ee, 4).tolist()}")
+                print(f"Min ee position {np.round(min_ee, 4).tolist()}")
             print(f"Max joint pos position {np.round(max_pos, 4).tolist()}")
             print(f"Min joint pos position {np.round(min_pos, 4).tolist()}")
             break
