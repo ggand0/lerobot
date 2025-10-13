@@ -57,6 +57,7 @@ from lerobot.robots import (  # noqa: F401
     RobotConfig,
     make_robot_from_config,
     so100_follower,
+    so101_follower,
 )
 from lerobot.teleoperators import (
     gamepad,  # noqa: F401
@@ -338,7 +339,8 @@ class RobotEnv(gym.Env):
         """
         super().reset(seed=seed, options=options)
 
-        self.robot.reset()
+        if hasattr(self.robot, 'reset'):
+            self.robot.reset()
 
         # Reset episode tracking variables.
         self.current_step = 0
@@ -370,7 +372,21 @@ class RobotEnv(gym.Env):
         # 1.0 action corresponds to no-op action
         action_dict["gripper"] = action[3] if self.use_gripper else 1.0
 
-        self.robot.send_action(action_dict)
+        # Check if this is a joint space robot without URDF support
+        if not hasattr(self.robot.config, 'urdf_path'):
+            # Check if we have leader positions from GearedLeaderControlWrapper
+            leader_positions = getattr(self, '_leader_positions', None)
+            if leader_positions:
+                # Use leader positions for direct joint mirroring
+                joint_action = {f"{name}.pos": pos for name, pos in leader_positions.items()}
+                self.robot.send_action(joint_action)
+            else:
+                # Fallback: send current positions (no movement)
+                current_obs = self.robot.get_observation()
+                joint_action = {key: current_obs[key] for key in current_obs if key.endswith('.pos')}
+                self.robot.send_action(joint_action)
+        else:
+            self.robot.send_action(action_dict)
 
         self._get_observation()
 
@@ -1107,8 +1123,9 @@ class EEObservationWrapper(gym.ObservationWrapper):
         """
         current_joint_pos = self.unwrapped.current_observation["agent_pos"]
 
-        current_ee_pos = self.kinematics.forward_kinematics(current_joint_pos)[:3, 3]
-        observation["agent_pos"] = np.concatenate([observation["agent_pos"], current_ee_pos], -1)
+        if self.kinematics is not None:
+            current_ee_pos = self.kinematics.forward_kinematics(current_joint_pos)[:3, 3]
+            observation["agent_pos"] = np.concatenate([observation["agent_pos"], current_ee_pos], -1)
         return observation
 
 
@@ -1154,10 +1171,12 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         self.event_lock = Lock()  # Thread-safe access to events
 
         # Initialize robot control
-        self.kinematics = RobotKinematics(
-            urdf_path=env.unwrapped.robot.config.urdf_path,
-            target_frame_name=env.unwrapped.robot.config.target_frame_name,
-        )
+        self.kinematics = None
+        if hasattr(env.unwrapped.robot.config, 'urdf_path') and hasattr(env.unwrapped.robot.config, 'target_frame_name'):
+            self.kinematics = RobotKinematics(
+                urdf_path=env.unwrapped.robot.config.urdf_path,
+                target_frame_name=env.unwrapped.robot.config.target_frame_name,
+            )
         self.leader_torque_enabled = True
         self.prev_leader_gripper = None
 
@@ -1261,17 +1280,25 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         self.leader_tracking_error_queue.append(np.linalg.norm(follower_pos[:-1] - leader_pos[:-1]))
 
         # [:3, 3] Last column of the transformation matrix corresponds to the xyz translation
-        leader_ee = self.kinematics.forward_kinematics(leader_pos)[:3, 3]
-        follower_ee = self.kinematics.forward_kinematics(follower_pos)[:3, 3]
+        if self.kinematics is not None:
+            leader_ee = self.kinematics.forward_kinematics(leader_pos)[:3, 3]
+            follower_ee = self.kinematics.forward_kinematics(follower_pos)[:3, 3]
 
-        action = np.clip(leader_ee - follower_ee, -self.end_effector_step_sizes, self.end_effector_step_sizes)
-        # Normalize the action to the range [-1, 1]
-        action = action / self.end_effector_step_sizes
+            action = np.clip(leader_ee - follower_ee, -self.end_effector_step_sizes, self.end_effector_step_sizes)
+            # Normalize the action to the range [-1, 1]
+            action = action / self.end_effector_step_sizes
+        else:
+            # Fallback: when no kinematics available, store leader positions for later use
+            # Store leader positions on the environment for the RobotEnv to use
+            self.unwrapped._leader_positions = {name: leader_pos_dict[name] for name in leader_pos_dict if name != 'gripper'}
+            # Return dummy end-effector action to satisfy wrapper interface
+            action = np.array([0.0, 0.0, 0.0])
 
         if self.use_gripper:
+            max_gripper_pos = getattr(self.robot_follower.config, 'max_gripper_pos', 100)
             if self.prev_leader_gripper is None:
                 self.prev_leader_gripper = np.clip(
-                    leader_pos[-1], 0, self.robot_follower.config.max_gripper_pos
+                    leader_pos[-1], 0, max_gripper_pos
                 )
 
             # Get gripper action delta based on leader pose
@@ -1279,7 +1306,7 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             gripper_delta = leader_gripper - self.prev_leader_gripper
 
             # Normalize by max angle and quantize to {0,1,2}
-            normalized_delta = gripper_delta / self.robot_follower.config.max_gripper_pos
+            normalized_delta = gripper_delta / max_gripper_pos
             if normalized_delta >= 0.3:
                 gripper_action = 2
             elif normalized_delta <= 0.1:
@@ -1936,17 +1963,27 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
             use_gripper=cfg.wrapper.use_gripper,
         )
     elif control_mode == "leader":
+        end_effector_step_sizes = getattr(cfg.robot, 'end_effector_step_sizes', {
+            "x": 0.02,
+            "y": 0.02,
+            "z": 0.02,
+        })
         env = GearedLeaderControlWrapper(
             env=env,
             teleop_device=teleop_device,
-            end_effector_step_sizes=cfg.robot.end_effector_step_sizes,
+            end_effector_step_sizes=end_effector_step_sizes,
             use_gripper=cfg.wrapper.use_gripper,
         )
     elif control_mode == "leader_automatic":
+        end_effector_step_sizes = getattr(cfg.robot, 'end_effector_step_sizes', {
+            "x": 0.02,
+            "y": 0.02,
+            "z": 0.02,
+        })
         env = GearedLeaderAutomaticControlWrapper(
             env=env,
             teleop_device=teleop_device,
-            end_effector_step_sizes=cfg.robot.end_effector_step_sizes,
+            end_effector_step_sizes=end_effector_step_sizes,
             use_gripper=cfg.wrapper.use_gripper,
         )
     else:
