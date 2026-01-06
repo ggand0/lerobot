@@ -517,6 +517,13 @@ class DrQV2Policy(PreTrainedPolicy):
         # Training state
         self._step = 0
 
+        # Compatibility aliases for learner.py
+        self.critic_ensemble = self.critic  # learner.py expects critic_ensemble
+        # Dummy log_alpha for temperature (DrQ-v2 doesn't use it, but learner expects it)
+        # Must have requires_grad=True for backward() to work, but loss is always 0
+        self.log_alpha = nn.Parameter(torch.tensor([0.0]), requires_grad=True)
+        self.temperature = 0.0  # Compatibility
+
     def _setup_input_shapes(self):
         """Setup input shapes from config."""
         config = self.config
@@ -707,19 +714,209 @@ class DrQV2Policy(PreTrainedPolicy):
     def forward(
         self,
         batch: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, dict | None]:
+        model: str = "critic",
+    ) -> dict[str, torch.Tensor]:
         """Training forward pass.
 
+        This method follows the LeRobot SAC interface where different model components
+        can be updated separately via the `model` parameter.
+
         Args:
-            batch: Dictionary containing observations, actions, rewards, etc.
+            batch: Dictionary containing:
+                - action: Action tensor (B, action_dim)
+                - reward: Reward tensor (B,) or (B, 1)
+                - state: Dict of current observations
+                - next_state: Dict of next observations
+                - done: Done mask tensor (B,) or (B, 1)
+            model: Which model to compute loss for ("critic" or "actor")
 
         Returns:
-            Tuple of (loss, info_dict)
+            Dictionary with loss tensors
         """
-        # This is a placeholder - full training loop to be implemented
-        # For now, return zero loss
-        loss = torch.tensor(0.0, device=self.config.device)
-        return loss, {}
+        if model == "critic":
+            return {"loss_critic": self.compute_loss_critic(batch)}
+        elif model == "actor":
+            return {"loss_actor": self.compute_loss_actor(batch)}
+        elif model == "temperature":
+            # DrQ-v2 doesn't use temperature - return zero loss for compatibility
+            # Multiply by log_alpha to make it require grad (but result is still 0)
+            return {"loss_temperature": self.log_alpha.exp() * 0.0}
+        else:
+            raise ValueError(f"Unknown model type: {model}")
+
+    def compute_loss_critic(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute critic loss using TD learning.
+
+        DrQ-v2 critic loss:
+        1. Apply random shift augmentation to images
+        2. Encode augmented observations
+        3. Compute target Q using target network
+        4. MSE loss between predicted and target Q
+        """
+        # Extract batch components
+        actions = batch["action"]
+        rewards = batch["reward"]
+        observations = batch["state"]
+        next_observations = batch["next_state"]
+        done = batch["done"]
+
+        # Ensure proper shapes
+        if rewards.dim() == 1:
+            rewards = rewards.unsqueeze(1)
+        if done.dim() == 1:
+            done = done.unsqueeze(1)
+
+        # Get current step for stddev schedule
+        step = self._step
+
+        # Process current observations with augmentation
+        low_dim_obs = None
+        if "observation.state" in observations:
+            low_dim_obs = observations["observation.state"]
+
+        rgb_obs = self._extract_rgb_obs_from_dict(observations)
+
+        # Apply random shift augmentation during training
+        if self.training and self.config.use_augmentation:
+            b, v, c, h, w = rgb_obs.shape
+            rgb_obs = self.aug(rgb_obs.float().view(b * v, c, h, w)).view(b, v, c, h, w)
+
+        # Encode current observations
+        multi_view_feats = self.encoder(rgb_obs.float())
+        fused_feats = self.view_fusion(multi_view_feats)
+
+        # Compute predicted Q values
+        q_values = self.critic(low_dim_obs, fused_feats, actions)  # (B, 1, num_critics)
+        q_values = q_values.squeeze(1)  # (B, num_critics)
+
+        # Compute target Q values (no gradient)
+        with torch.no_grad():
+            # Process next observations with augmentation
+            next_low_dim_obs = None
+            if "observation.state" in next_observations:
+                next_low_dim_obs = next_observations["observation.state"]
+
+            next_rgb_obs = self._extract_rgb_obs_from_dict(next_observations)
+
+            # Apply augmentation to next observations too
+            if self.training and self.config.use_augmentation:
+                b, v, c, h, w = next_rgb_obs.shape
+                next_rgb_obs = self.aug(next_rgb_obs.float().view(b * v, c, h, w)).view(b, v, c, h, w)
+
+            # Encode next observations
+            next_multi_view_feats = self.encoder(next_rgb_obs.float())
+            next_fused_feats = self.view_fusion(next_multi_view_feats)
+
+            # Get next actions from actor with scheduled noise
+            std = self.get_std(step)
+            dist = self.actor(next_low_dim_obs, next_fused_feats, std)
+            next_actions = dist.sample(clip=self.config.stddev_clip)
+
+            # Compute target Q values using target critic
+            target_q_values = self.critic_target(next_low_dim_obs, next_fused_feats, next_actions)
+            target_q_values = target_q_values.squeeze(1)  # (B, num_critics)
+
+            # Take minimum across critics
+            min_target_q = target_q_values.min(dim=-1, keepdim=True)[0]  # (B, 1)
+
+            # Compute TD target: r + gamma * (1 - done) * min_Q_target
+            td_target = rewards + self.config.discount * (1 - done) * min_target_q
+
+        # Repeat TD target for each critic
+        td_target = td_target.repeat(1, self.config.num_critics)
+
+        # Compute MSE loss across all critics
+        critic_loss = F.mse_loss(q_values, td_target, reduction="none")
+        critic_loss = critic_loss.mean(dim=1).sum()  # Mean per sample, sum across batch for each critic
+
+        return critic_loss
+
+    def compute_loss_actor(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute actor loss using policy gradient.
+
+        DrQ-v2 actor loss: -min(Q(s, pi(s)))
+        No entropy term (unlike SAC) - exploration is via scheduled noise.
+        """
+        observations = batch["state"]
+        step = self._step
+
+        # Extract observations
+        low_dim_obs = None
+        if "observation.state" in observations:
+            low_dim_obs = observations["observation.state"]
+
+        rgb_obs = self._extract_rgb_obs_from_dict(observations)
+
+        # Encode observations (detach from encoder to prevent actor gradient through encoder)
+        with torch.no_grad():
+            multi_view_feats = self.encoder(rgb_obs.float())
+        fused_feats = self.view_fusion(multi_view_feats)
+        fused_feats = fused_feats.detach()
+
+        # Get actions from actor
+        std = self.get_std(step)
+        dist = self.actor(low_dim_obs, fused_feats, std)
+        actions = dist.sample(clip=self.config.stddev_clip)
+
+        # Compute Q values for actor-sampled actions
+        # Detach features since encoder should only be trained via critic
+        q_values = self.critic(
+            low_dim_obs.detach() if low_dim_obs is not None else None,
+            fused_feats.detach(),
+            actions,
+        )
+        q_values = q_values.squeeze(1)  # (B, num_critics)
+
+        # Actor loss: maximize Q (minimize -Q)
+        min_q = q_values.min(dim=-1)[0]  # (B,)
+        actor_loss = -min_q.mean()
+
+        return actor_loss
+
+    def _extract_rgb_obs_from_dict(self, obs_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Extract and stack RGB observations from observation dict.
+
+        Args:
+            obs_dict: Dictionary of observations
+
+        Returns:
+            Tensor of shape (B, V, C, H, W)
+        """
+        # Use explicit keys if set (for checkpoint loading), otherwise use config
+        if hasattr(self, "_explicit_image_keys"):
+            image_keys = self._explicit_image_keys
+        else:
+            image_keys = self.config.image_features
+
+        images = []
+
+        # Try configured keys first, then fall back to any image key
+        for key in image_keys:
+            if key in obs_dict:
+                img = obs_dict[key]
+                # Ensure proper shape (B, C, H, W)
+                if img.dim() == 3:
+                    img = img.unsqueeze(0)
+                images.append(img)
+
+        # If no configured keys found, try any key starting with observation.image
+        if not images:
+            for key in obs_dict:
+                if key.startswith("observation.image"):
+                    img = obs_dict[key]
+                    if img.dim() == 3:
+                        img = img.unsqueeze(0)
+                    images.append(img)
+
+        if not images:
+            raise ValueError(f"No image keys found in observations. Expected: {image_keys}, got: {list(obs_dict.keys())}")
+
+        # Stack along view dimension: (B, V, C, H, W)
+        return torch.stack(images, dim=1)
+
+    def set_step(self, step: int):
+        """Set current training step for stddev schedule."""
+        self._step = step
 
     def predict_action_chunk(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Predict action chunk. DrQ-v2 predicts single actions, not chunks."""
@@ -728,6 +925,10 @@ class DrQV2Policy(PreTrainedPolicy):
     def update_target_networks(self):
         """Soft update of target critic network."""
         soft_update_params(self.critic, self.critic_target, self.config.critic_target_tau)
+
+    def update_temperature(self):
+        """Update temperature - no-op for DrQ-v2 (no temperature learning)."""
+        pass  # DrQ-v2 doesn't use temperature
 
     @classmethod
     def from_robobase_checkpoint(
@@ -981,6 +1182,14 @@ class DrQV2Policy(PreTrainedPolicy):
             policy.aug = nn.Identity()
 
         policy._step = 0
+
+        # Compatibility aliases for learner.py
+        policy.critic_ensemble = policy.critic
+        policy.log_alpha = nn.Parameter(torch.tensor([0.0]), requires_grad=True)
+        policy.temperature = 0.0
+
+        # Store explicit image keys for checkpoint loading
+        policy._explicit_image_keys = ["observation.image"]
 
         return policy
 

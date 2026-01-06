@@ -111,6 +111,13 @@ class DrQV2Config(PreTrainedConfig):
     online_step_before_learning: int = 100
     policy_update_freq: int = 1
 
+    # Compatibility with learner.py
+    num_discrete_actions: int | None = None  # DrQ-v2 doesn't use discrete actions
+    shared_encoder: bool = True  # DrQ-v2 uses shared encoder
+    vision_encoder_name: str | None = None  # DrQ-v2 uses custom encoder
+    freeze_vision_encoder: bool = False  # DrQ-v2 trains the encoder
+    grad_clip_norm: float = 1.0  # Gradient clipping
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -141,6 +148,14 @@ class DrQV2Config(PreTrainedConfig):
 
     @property
     def image_features(self) -> list[str]:
+        """Get list of image feature keys.
+
+        Returns keys starting with 'observation.image' from input_features.
+        Falls back to default if input_features not set (e.g., when loading from checkpoint).
+        """
+        if not self.input_features:
+            # Default fallback for checkpoint loading
+            return ["observation.image"]
         return [key for key in self.input_features if key.startswith(OBS_IMAGE)]
 
     @property
