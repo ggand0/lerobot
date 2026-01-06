@@ -179,6 +179,7 @@ class EnvTransformConfig:
     add_joint_velocity_to_observation: bool = False
     add_current_to_observation: bool = False
     add_ee_pose_to_observation: bool = False
+    add_full_proprioception: bool = False  # 18-dim state: joint_pos + joint_vel + ee_xyz + ee_euler
     crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None
     resize_size: tuple[int, int] | None = None
     control_time_s: float = 20.0

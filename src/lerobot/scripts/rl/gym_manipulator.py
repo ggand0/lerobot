@@ -1153,6 +1153,150 @@ class EEObservationWrapper(gym.ObservationWrapper):
         return observation
 
 
+def rotation_matrix_to_euler(R):
+    """
+    Convert a 3x3 rotation matrix to euler angles (roll, pitch, yaw).
+
+    Uses the ZYX convention (yaw-pitch-roll) which is common in robotics.
+
+    Args:
+        R: 3x3 rotation matrix
+
+    Returns:
+        numpy array of [roll, pitch, yaw] in radians
+    """
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+
+    if not singular:
+        roll = np.arctan2(R[2, 1], R[2, 2])
+        pitch = np.arctan2(-R[2, 0], sy)
+        yaw = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        roll = np.arctan2(-R[1, 2], R[1, 1])
+        pitch = np.arctan2(-R[2, 0], sy)
+        yaw = 0
+
+    return np.array([roll, pitch, yaw])
+
+
+class FullProprioceptionWrapper(gym.ObservationWrapper):
+    """
+    Wrapper that provides the full 18-dim proprioceptive state matching the sim DrQ-v2 training.
+
+    The proprioceptive state consists of:
+    - joint_pos (6): Joint positions
+    - joint_vel (6): Joint velocities (computed from position delta)
+    - gripper_xyz (3): End-effector position from FK
+    - gripper_euler (3): End-effector orientation as euler angles from FK
+
+    This wrapper replaces AddJointVelocityToObservation and EEObservationWrapper
+    when training DrQ-v2 with the corrected 54-dim state (18 dims × 3 frame stack).
+    """
+
+    def __init__(self, env, fps=30, num_dof=6):
+        """
+        Initialize the full proprioception wrapper.
+
+        Args:
+            env: The environment to wrap.
+            fps: Frames per second used to calculate velocity.
+            num_dof: Number of degrees of freedom (joints) in the robot.
+        """
+        super().__init__(env)
+
+        self.num_dof = num_dof
+        self.dt = 1.0 / fps
+        self.last_joint_positions = np.zeros(num_dof)
+
+        # Full proprioceptive state: joint_pos(6) + joint_vel(6) + ee_xyz(3) + ee_euler(3) = 18
+        state_dim = num_dof + num_dof + 3 + 3  # 18
+
+        # Define bounds for the full state
+        # Joint positions: 0-360 degrees (or whatever the robot limits are)
+        joint_pos_low = np.zeros(num_dof)
+        joint_pos_high = np.ones(num_dof) * 360.0
+
+        # Joint velocities: symmetric limits
+        joint_vel_limit = 100.0
+        joint_vel_low = np.ones(num_dof) * -joint_vel_limit
+        joint_vel_high = np.ones(num_dof) * joint_vel_limit
+
+        # EE position limits (in meters, typical robot workspace)
+        ee_xyz_low = np.array([-0.5, -0.5, 0.0])
+        ee_xyz_high = np.array([0.5, 0.5, 0.5])
+
+        # Euler angles: -pi to pi
+        ee_euler_low = np.array([-np.pi, -np.pi, -np.pi])
+        ee_euler_high = np.array([np.pi, np.pi, np.pi])
+
+        # Concatenate all bounds
+        low = np.concatenate([joint_pos_low, joint_vel_low, ee_xyz_low, ee_euler_low])
+        high = np.concatenate([joint_pos_high, joint_vel_high, ee_xyz_high, ee_euler_high])
+
+        self.observation_space["observation.state"] = gym.spaces.Box(
+            low=low,
+            high=high,
+            shape=(state_dim,),
+            dtype=np.float32,
+        )
+
+        # Initialize kinematics
+        self.kinematics = RobotKinematics(
+            urdf_path=env.unwrapped.robot.config.urdf_path,
+            target_frame_name=env.unwrapped.robot.config.target_frame_name,
+        )
+
+    def observation(self, observation):
+        """
+        Compute the full 18-dim proprioceptive state.
+
+        Args:
+            observation: Original observation from the environment.
+
+        Returns:
+            Observation with full proprioceptive state.
+        """
+        # Get current joint positions (6 dims)
+        joint_pos = observation["agent_pos"][:self.num_dof]
+
+        # Compute joint velocities (6 dims)
+        joint_vel = (joint_pos - self.last_joint_positions) / self.dt
+        self.last_joint_positions = joint_pos.copy()
+
+        # Get end-effector pose via FK
+        current_joint_pos = self.unwrapped.current_observation["agent_pos"]
+        T = self.kinematics.forward_kinematics(current_joint_pos)
+
+        # Extract position (3 dims)
+        ee_xyz = T[:3, 3]
+
+        # Extract euler angles from rotation matrix (3 dims)
+        R = T[:3, :3]
+        ee_euler = rotation_matrix_to_euler(R)
+
+        # Concatenate into full 18-dim state
+        full_state = np.concatenate([joint_pos, joint_vel, ee_xyz, ee_euler])
+        observation["agent_pos"] = full_state
+
+        return observation
+
+    def reset(self, **kwargs):
+        """
+        Reset the wrapper and clear velocity history.
+
+        Args:
+            **kwargs: Keyword arguments passed to the wrapped environment's reset.
+
+        Returns:
+            The initial observation and info.
+        """
+        obs, info = self.env.reset(**kwargs)
+        # Initialize last positions to current to avoid velocity spike on first step
+        self.last_joint_positions = obs["agent_pos"][:self.num_dof].copy() if "agent_pos" in obs else np.zeros(self.num_dof)
+        return self.observation(obs), info
+
+
 ###########################################################
 # Wrappers related to human intervention and input devices
 ###########################################################
@@ -1946,12 +2090,18 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
 
     # Add observation and image processing
     if cfg.wrapper:
-        if cfg.wrapper.add_joint_velocity_to_observation:
-            env = AddJointVelocityToObservation(env=env, fps=cfg.fps)
-        if cfg.wrapper.add_current_to_observation:
-            env = AddCurrentToObservation(env=env)
-        if cfg.wrapper.add_ee_pose_to_observation:
-            env = EEObservationWrapper(env=env, ee_pose_limits=robot.end_effector_bounds)
+        # Full proprioception mode provides 18-dim state for DrQ-v2:
+        # joint_pos(6) + joint_vel(6) + ee_xyz(3) + ee_euler(3)
+        if getattr(cfg.wrapper, 'add_full_proprioception', False):
+            env = FullProprioceptionWrapper(env=env, fps=cfg.fps)
+        else:
+            # Legacy mode: individual wrappers
+            if cfg.wrapper.add_joint_velocity_to_observation:
+                env = AddJointVelocityToObservation(env=env, fps=cfg.fps)
+            if cfg.wrapper.add_current_to_observation:
+                env = AddCurrentToObservation(env=env)
+            if cfg.wrapper.add_ee_pose_to_observation:
+                env = EEObservationWrapper(env=env, ee_pose_limits=robot.end_effector_bounds)
 
     env = ConvertToLeRobotObservation(env=env, device=cfg.device)
 
