@@ -875,8 +875,16 @@ class ResetWrapper(gym.Wrapper):
             )
             start_time = time.perf_counter()
             while time.perf_counter() - start_time < self.reset_time_s:
-                action = self.env.robot_leader.get_action()
-                self.unwrapped.robot.send_action(action)
+                # For SO-101 without URDF, directly mirror leader joint positions
+                if hasattr(self.env, 'robot_leader') and not hasattr(self.unwrapped.robot.config, 'urdf_path'):
+                    # Read leader positions and mirror to follower
+                    leader_pos_dict = self.env.robot_leader.bus.sync_read("Present_Position")
+                    joint_action = {f"{name}.pos": pos for name, pos in leader_pos_dict.items()}
+                    self.unwrapped.robot.send_action(joint_action)
+                else:
+                    # Use normal action pipeline for URDF-based robots
+                    action = self.env.robot_leader.get_action()
+                    self.unwrapped.robot.send_action(action)
 
             log_say("Manual reset of the environment done.", play_sounds=True)
 
@@ -953,7 +961,8 @@ class GripperPenaltyWrapper(gym.RewardWrapper):
         Returns:
             Modified reward with penalty applied if necessary.
         """
-        gripper_state_normalized = self.last_gripper_state / self.unwrapped.robot.config.max_gripper_pos
+        max_gripper_pos = getattr(self.unwrapped.robot.config, 'max_gripper_pos', 100)
+        gripper_state_normalized = self.last_gripper_state / max_gripper_pos
 
         action_normalized = action - 1.0  # action / MAX_GRIPPER_COMMAND
 
@@ -1052,12 +1061,13 @@ class GripperActionWrapper(gym.ActionWrapper):
             gripper_command = (
                 np.sign(gripper_command) if abs(gripper_command) > self.quantization_threshold else 0.0
             )
-        gripper_command = gripper_command * self.unwrapped.robot.config.max_gripper_pos
+        max_gripper_pos = getattr(self.unwrapped.robot.config, 'max_gripper_pos', 100)
+        gripper_command = gripper_command * max_gripper_pos
 
         gripper_state = self.unwrapped.robot.bus.sync_read("Present_Position")["gripper"]
 
         gripper_action_value = np.clip(
-            gripper_state + gripper_command, 0, self.unwrapped.robot.config.max_gripper_pos
+            gripper_state + gripper_command, 0, max_gripper_pos
         )
         action[-1] = gripper_action_value.item()
         return action
@@ -1370,10 +1380,11 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         info["is_intervention"] = is_intervention
         info["action_intervention"] = action
 
+        max_gripper_pos = getattr(self.robot_follower.config, 'max_gripper_pos', 100)
         self.prev_leader_gripper = np.clip(
             self.robot_leader.bus.sync_read("Present_Position")["gripper"],
             0,
-            self.robot_follower.config.max_gripper_pos,
+            max_gripper_pos,
         )
 
         # Check for success or manual termination
@@ -1461,7 +1472,9 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         Returns:
             Boolean indicating whether intervention mode is active.
         """
-        return self.keyboard_events["human_intervention_step"]
+        # For demonstration recording (no policy), always enable intervention
+        # This keeps the leader arm's torque disabled so it can be freely moved
+        return True  # Always in intervention mode for SO-101 demonstration recording
 
 
 class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
