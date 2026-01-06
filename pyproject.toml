@@ -57,18 +57,17 @@ classifiers = [
 keywords = ["lerobot", "huggingface", "robotics",  "machine learning", "artificial intelligence"]
 
 dependencies = [
-
     # Hugging Face dependencies
     "datasets>=2.19.0,<=3.6.0", # TODO: Bumb dependency
     "diffusers>=0.27.2",
     "huggingface-hub[hf-transfer,cli]>=0.34.2",
-
     # Core dependencies
     "cmake>=3.29.0.1",
     "einops>=0.8.0",
     "opencv-python-headless>=4.9.0",
     "av>=14.2.0",
     "torch>=2.2.1",
+    "pytorch-triton-rocm>=3.2.0; sys_platform == 'linux'",
     "torchcodec>=0.2.1; sys_platform != 'win32' and (sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')) and (sys_platform != 'darwin' or platform_machine != 'x86_64')",
     "torchvision>=0.21.0",
     "jsonlines>=4.0.0",
@@ -76,16 +75,15 @@ dependencies = [
     "pynput>=1.7.7",
     "pyserial>=3.5",
     "wandb>=0.20.0",
-
     "draccus==0.10.0", # TODO: Remove ==
     "gymnasium>=0.29.1,<1.0.0", # TODO: Bumb dependency
     "rerun-sdk>=0.21.0,<0.23.0", # TODO: Bumb dependency
-
     # Support dependencies
     "deepdiff>=7.0.1,<9.0.0",
     "flask>=3.0.3,<4.0.0",
     "imageio[ffmpeg]>=2.34.0,<3.0.0",
     "termcolor>=2.4.0,<4.0.0",
+    "feetech-servo-sdk>=1.0.0",
 ]
 
 # Optional dependencies
@@ -261,3 +259,19 @@ default.extend-ignore-identifiers-re = [
 # warn_return_any = true
 # warn_unused_configs = true
 # ignore_missing_imports = false
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-rocm" },
+]
+torchvision = [
+    { index = "pytorch-rocm" },
+]
+pytorch-triton-rocm = [
+    { index = "pytorch-rocm" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true

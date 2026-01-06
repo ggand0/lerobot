@@ -798,6 +798,20 @@ class ConvertToLeRobotObservation(gym.ObservationWrapper):
 
         self.device = torch.device(device)
 
+        # Update observation space to reflect CHW format after preprocessing
+        # preprocess_observation converts images from HWC to CHW
+        new_observation_space = {}
+        for key, space in self.observation_space.items():
+            if "image" in key and isinstance(space, gym.spaces.Box) and len(space.shape) == 3:
+                h, w, c = space.shape
+                # Convert HWC to CHW
+                new_observation_space[key] = gym.spaces.Box(
+                    low=0.0, high=1.0, shape=(c, h, w), dtype=np.float32
+                )
+            else:
+                new_observation_space[key] = space
+        self.observation_space = gym.spaces.Dict(new_observation_space)
+
     def observation(self, observation):
         """
         Convert observations to LeRobot format.
@@ -1389,11 +1403,15 @@ class BaseLeaderControlWrapper(gym.Wrapper):
 
         # Check for success or manual termination
         success = self.keyboard_events["episode_success"]
+        rerecord = self.keyboard_events["rerecord_episode"]
         terminated = terminated or self.keyboard_events["episode_end"] or success
 
         if success:
             reward = 1.0
             logging.info("Episode ended successfully with reward 1.0")
+
+        # Propagate rerecord signal to info for recording loop
+        info["rerecord_episode"] = rerecord
 
         return obs, reward, terminated, truncated, info
 
