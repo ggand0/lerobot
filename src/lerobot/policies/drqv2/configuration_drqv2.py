@@ -118,6 +118,12 @@ class DrQV2Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # DrQ-v2 trains the encoder
     grad_clip_norm: float = 1.0  # Gradient clipping
 
+    # Pretrained model path (used when loading from checkpoint)
+    pretrained_path: str | None = None
+
+    # Actor-learner config for distributed training (HIL-SERL)
+    actor_learner_config: dict | None = None
+
     def __post_init__(self):
         super().__post_init__()
 
