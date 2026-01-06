@@ -18,7 +18,7 @@ import os
 from importlib.resources import files
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TypeVar
+from typing import TYPE_CHECKING, TypeVar
 
 import packaging
 import safetensors
@@ -29,8 +29,11 @@ from safetensors.torch import load_model as load_model_as_safetensor, save_model
 from torch import Tensor, nn
 
 from lerobot.configs.policies import PreTrainedConfig
-from lerobot.configs.train import TrainPipelineConfig
 from lerobot.policies.utils import log_model_loading_keys
+
+if TYPE_CHECKING:
+    from lerobot.configs.train import TrainPipelineConfig
+
 from lerobot.utils.hub import HubMixin
 
 T = TypeVar("T", bound="PreTrainedPolicy")
@@ -200,7 +203,7 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     def push_model_to_hub(
         self,
-        cfg: TrainPipelineConfig,
+        cfg: "TrainPipelineConfig",
     ):
         api = HfApi()
         repo_id = api.create_repo(

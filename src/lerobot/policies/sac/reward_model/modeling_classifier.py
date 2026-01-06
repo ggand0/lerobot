@@ -17,6 +17,7 @@
 import logging
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from lerobot.constants import OBS_IMAGE, REWARD
@@ -211,8 +212,17 @@ class Classifier(PreTrainedPolicy):
             ),
         )
 
+    def _resize_images(self, x: torch.Tensor) -> torch.Tensor:
+        """Resize images to expected size."""
+        target_size = self.config.image_size
+        if x.shape[-2:] != (target_size, target_size):
+            x = F.interpolate(x, size=(target_size, target_size), mode="bilinear", align_corners=False)
+        return x
+
     def _get_encoder_output(self, x: torch.Tensor, image_key: str) -> torch.Tensor:
         """Extract the appropriate output from the encoder."""
+        # Resize images to expected size
+        x = self._resize_images(x)
         with torch.no_grad():
             if self.is_cnn:
                 # The HF ResNet applies pooling internally

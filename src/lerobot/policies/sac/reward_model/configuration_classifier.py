@@ -36,6 +36,7 @@ class RewardClassifierConfig(PreTrainedConfig):
     device: str = "cpu"
     model_type: str = "cnn"  # "transformer" or "cnn"
     num_cameras: int = 2
+    image_size: int = 84  # Resize images to this size (square)
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     grad_clip_norm: float = 1.0
