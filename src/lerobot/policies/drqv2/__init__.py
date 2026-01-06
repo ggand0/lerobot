@@ -1,4 +1,5 @@
-# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2025 The HuggingFace Inc. team.
+# All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +13,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .act.configuration_act import ACTConfig as ACTConfig
-from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
-from .drqv2.configuration_drqv2 import DrQV2Config as DrQV2Config
-from .pi0.configuration_pi0 import PI0Config as PI0Config
-from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
-from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
-from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
+"""DrQ-v2 Policy for LeRobot."""
+
+from .configuration_drqv2 import DrQV2Config
+from .modeling_drqv2 import (
+    DrQV2Actor,
+    DrQV2Critic,
+    DrQV2Encoder,
+    DrQV2Policy,
+    RandomShiftsAug,
+    ViewFusion,
+)
+
+__all__ = [
+    "DrQV2Config",
+    "DrQV2Policy",
+    "DrQV2Encoder",
+    "DrQV2Actor",
+    "DrQV2Critic",
+    "RandomShiftsAug",
+    "ViewFusion",
+]
