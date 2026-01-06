@@ -1314,7 +1314,8 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         else:
             # Fallback: when no kinematics available, store leader positions for later use
             # Store leader positions on the environment for the RobotEnv to use
-            self.unwrapped._leader_positions = {name: leader_pos_dict[name] for name in leader_pos_dict if name != 'gripper'}
+            # Include gripper for direct joint mirroring
+            self.unwrapped._leader_positions = {name: leader_pos_dict[name] for name in leader_pos_dict}
             # Return dummy end-effector action to satisfy wrapper interface
             action = np.array([0.0, 0.0, 0.0])
 
