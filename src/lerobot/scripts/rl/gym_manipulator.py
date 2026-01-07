@@ -910,19 +910,19 @@ class ResetWrapper(gym.Wrapper):
         """
         start_time = time.perf_counter()
         if self.reset_pose is not None:
-            log_say("Reset the environment.", play_sounds=True)
+            log_say("Reset the environment.", play_sounds=False)
             reset_follower_position(self.unwrapped.robot, self.reset_pose)
-            log_say("Reset the environment done.", play_sounds=True)
+            log_say("Reset the environment done.", play_sounds=False)
 
             if hasattr(self.env, "robot_leader"):
                 self.env.robot_leader.bus.sync_write("Torque_Enable", 1)
-                log_say("Reset the leader robot.", play_sounds=True)
+                log_say("Reset the leader robot.", play_sounds=False)
                 reset_follower_position(self.env.robot_leader, self.reset_pose)
-                log_say("Reset the leader robot done.", play_sounds=True)
+                log_say("Reset the leader robot done.", play_sounds=False)
         else:
             log_say(
                 f"Manually reset the environment for {self.reset_time_s} seconds.",
-                play_sounds=True,
+                play_sounds=False,
             )
             start_time = time.perf_counter()
             while time.perf_counter() - start_time < self.reset_time_s:
@@ -937,7 +937,7 @@ class ResetWrapper(gym.Wrapper):
                     action = self.env.robot_leader.get_action()
                     self.unwrapped.robot.send_action(action)
 
-            log_say("Manual reset of the environment done.", play_sounds=True)
+            log_say("Manual reset of the environment done.", play_sounds=False)
 
         busy_wait(self.reset_time_s - (time.perf_counter() - start_time))
 
@@ -1674,11 +1674,11 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
                     "Place the leader in similar pose to the follower and press space again."
                 )
                 self.keyboard_events["human_intervention_step"] = True
-                log_say("Human intervention step.", play_sounds=True)
+                log_say("Human intervention step.", play_sounds=False)
             else:
                 self.keyboard_events["human_intervention_step"] = False
                 logging.info("Space key pressed for a second time.\nContinuing with policy actions.")
-                log_say("Continuing with policy actions.", play_sounds=True)
+                log_say("Continuing with policy actions.", play_sounds=False)
 
     def _check_intervention(self):
         """
@@ -1749,7 +1749,7 @@ class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
         ):
             self.is_intervention_active = True
             self.leader_tracking_error_queue.clear()
-            log_say("Intervention started", play_sounds=True)
+            log_say("Intervention started", play_sounds=False)
             return True
 
         # Track the error over time in leader_tracking_error_queue
@@ -1761,7 +1761,7 @@ class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
         ):
             self.is_intervention_active = False
             self.leader_tracking_error_queue.clear()
-            log_say("Intervention ended", play_sounds=True)
+            log_say("Intervention ended", play_sounds=False)
             return False
 
         # If not change has happened that merits a change in the intervention state, return the current state
@@ -2353,7 +2353,7 @@ def record_dataset(env, policy, cfg):
     while episode_index < cfg.num_episodes:
         obs, _ = env.reset()
         start_episode_t = time.perf_counter()
-        log_say(f"Recording episode {episode_index}", play_sounds=True)
+        log_say(f"Recording episode {episode_index}", play_sounds=False)
 
         # Track success state collection
         success_detected = False
