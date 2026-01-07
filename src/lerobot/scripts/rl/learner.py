@@ -991,6 +991,9 @@ def initialize_offline_replay_buffer(
     """
     Initialize an offline replay buffer from a dataset.
 
+    Uses caching to avoid re-converting the dataset on every run.
+    The cache is stored at {output_dir}/offline_buffer.pt
+
     Args:
         cfg (TrainRLServerPipelineConfig): Training configuration
         device (str): Device to store tensors on
@@ -999,6 +1002,21 @@ def initialize_offline_replay_buffer(
     Returns:
         ReplayBuffer: Initialized offline replay buffer
     """
+    # Check for cached buffer
+    cache_path = os.path.join(cfg.output_dir, "offline_buffer")
+    cache_file = f"{cache_path}.pt"
+
+    if os.path.exists(cache_file):
+        logging.info(f"Loading cached offline replay buffer from {cache_file}")
+        offline_replay_buffer = ReplayBuffer.load(
+            cache_path,
+            device=device,
+            storage_device=storage_device,
+        )
+        logging.info(f"Loaded {len(offline_replay_buffer)} transitions from cache")
+        return offline_replay_buffer
+
+    # No cache - need to convert from dataset
     if not cfg.resume:
         logging.info("make_dataset offline buffer")
         offline_dataset = make_dataset(cfg)
@@ -1019,6 +1037,12 @@ def initialize_offline_replay_buffer(
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
     )
+
+    # Save to cache for future runs
+    logging.info(f"Saving offline replay buffer cache to {cache_file}")
+    offline_replay_buffer.save(cache_path)
+    logging.info("Cache saved successfully")
+
     return offline_replay_buffer
 
 
