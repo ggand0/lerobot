@@ -384,6 +384,13 @@ def add_actor_information_and_train(
 
         # Wait until the replay buffer has enough samples to start training
         if len(replay_buffer) < online_step_before_learning:
+            # Log waiting status periodically
+            if optimization_step == 0 and not hasattr(add_actor_information_and_train, '_waiting_logged'):
+                logging.info(
+                    f"[LEARNER] Waiting for actor to connect and send {online_step_before_learning} transitions... "
+                    f"(current: {len(replay_buffer)}/{online_step_before_learning})"
+                )
+                add_actor_information_and_train._waiting_logged = True
             continue
 
         if online_iterator is None:
