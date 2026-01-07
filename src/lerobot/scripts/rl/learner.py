@@ -391,6 +391,11 @@ def add_actor_information_and_train(
                     f"(current: {len(replay_buffer)}/{online_step_before_learning})"
                 )
                 add_actor_information_and_train._waiting_logged = True
+            # Wait with timeout to avoid busy-waiting while respecting shutdown
+            if shutdown_event is not None:
+                shutdown_event.wait(timeout=0.1)
+            else:
+                time.sleep(0.1)
             continue
 
         if online_iterator is None:
@@ -868,7 +873,16 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     # Case 2: Resuming training
     checkpoint_dir = os.path.join(out_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
     if not os.path.exists(checkpoint_dir):
-        raise RuntimeError(f"No model checkpoint found in {checkpoint_dir} for resume=True")
+        # No checkpoint exists yet - this is fine, just start fresh but keep resume=true
+        # so the output dir isn't treated as an error and actor can connect
+        logging.info(
+            colored(
+                "No checkpoint found but resume=True: starting fresh (output dir already exists)",
+                color="yellow",
+                attrs=["bold"],
+            )
+        )
+        return cfg
 
     # Log that we found a valid checkpoint and are resuming
     logging.info(
@@ -961,31 +975,35 @@ def initialize_replay_buffer(
     Returns:
         ReplayBuffer: Initialized replay buffer
     """
-    if not cfg.resume:
-        return ReplayBuffer(
+    # Check if there's a saved online dataset to resume from
+    dataset_path = os.path.join(cfg.output_dir, "dataset")
+
+    if cfg.resume and os.path.exists(dataset_path):
+        logging.info("Resume training: loading online dataset from checkpoint")
+        # NOTE: In RL is possible to not have a dataset.
+        repo_id = None
+        if cfg.dataset is not None:
+            repo_id = cfg.dataset.repo_id
+        dataset = LeRobotDataset(
+            repo_id=repo_id,
+            root=dataset_path,
+        )
+        return ReplayBuffer.from_lerobot_dataset(
+            lerobot_dataset=dataset,
             capacity=cfg.policy.online_buffer_capacity,
             device=device,
             state_keys=cfg.policy.input_features.keys(),
-            storage_device=storage_device,
             optimize_memory=True,
         )
 
-    logging.info("Resume training load the online dataset")
-    dataset_path = os.path.join(cfg.output_dir, "dataset")
-
-    # NOTE: In RL is possible to not have a dataset.
-    repo_id = None
-    if cfg.dataset is not None:
-        repo_id = cfg.dataset.repo_id
-    dataset = LeRobotDataset(
-        repo_id=repo_id,
-        root=dataset_path,
-    )
-    return ReplayBuffer.from_lerobot_dataset(
-        lerobot_dataset=dataset,
+    # Start with empty buffer (either fresh start or resume without saved dataset)
+    if cfg.resume:
+        logging.info("Resume training: no saved online dataset found, starting with empty buffer")
+    return ReplayBuffer(
         capacity=cfg.policy.online_buffer_capacity,
         device=device,
         state_keys=cfg.policy.input_features.keys(),
+        storage_device=storage_device,
         optimize_memory=True,
     )
 

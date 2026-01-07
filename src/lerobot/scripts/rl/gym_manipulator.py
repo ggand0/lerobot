@@ -1241,11 +1241,18 @@ class FullProprioceptionWrapper(gym.ObservationWrapper):
             dtype=np.float32,
         )
 
-        # Initialize kinematics
-        self.kinematics = RobotKinematics(
-            urdf_path=env.unwrapped.robot.config.urdf_path,
-            target_frame_name=env.unwrapped.robot.config.target_frame_name,
-        )
+        # Initialize kinematics - support both URDF and MuJoCo-based robots
+        self.kinematics = None
+        self.use_mujoco_fk = False
+
+        if hasattr(env.unwrapped.robot.config, 'urdf_path') and env.unwrapped.robot.config.urdf_path:
+            self.kinematics = RobotKinematics(
+                urdf_path=env.unwrapped.robot.config.urdf_path,
+                target_frame_name=env.unwrapped.robot.config.target_frame_name,
+            )
+        elif hasattr(env.unwrapped.robot, 'mj_data'):
+            # MuJoCo-based robot (like SO101FollowerEndEffector)
+            self.use_mujoco_fk = True
 
     def observation(self, observation):
         """
@@ -1265,15 +1272,23 @@ class FullProprioceptionWrapper(gym.ObservationWrapper):
         self.last_joint_positions = joint_pos.copy()
 
         # Get end-effector pose via FK
-        current_joint_pos = self.unwrapped.current_observation["agent_pos"]
-        T = self.kinematics.forward_kinematics(current_joint_pos)
-
-        # Extract position (3 dims)
-        ee_xyz = T[:3, 3]
-
-        # Extract euler angles from rotation matrix (3 dims)
-        R = T[:3, :3]
-        ee_euler = rotation_matrix_to_euler(R)
+        if self.use_mujoco_fk:
+            # Use MuJoCo FK from the robot
+            robot = self.unwrapped.robot
+            ee_xyz = robot.mj_data.site_xpos[robot.ee_site_id].copy()
+            # Get rotation matrix from MuJoCo (3x3 stored as 9-element array in row-major)
+            xmat = robot.mj_data.site_xmat[robot.ee_site_id].reshape(3, 3)
+            ee_euler = rotation_matrix_to_euler(xmat)
+        elif self.kinematics is not None:
+            current_joint_pos = self.unwrapped.current_observation["agent_pos"]
+            T = self.kinematics.forward_kinematics(current_joint_pos)
+            ee_xyz = T[:3, 3]
+            R = T[:3, :3]
+            ee_euler = rotation_matrix_to_euler(R)
+        else:
+            # Fallback: zeros for EE pose if no FK available
+            ee_xyz = np.zeros(3)
+            ee_euler = np.zeros(3)
 
         # Concatenate into full 18-dim state
         full_state = np.concatenate([joint_pos, joint_vel, ee_xyz, ee_euler])
@@ -2101,7 +2116,10 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
             if cfg.wrapper.add_current_to_observation:
                 env = AddCurrentToObservation(env=env)
             if cfg.wrapper.add_ee_pose_to_observation:
-                env = EEObservationWrapper(env=env, ee_pose_limits=robot.end_effector_bounds)
+                # Only use EEObservationWrapper for URDF-based robots
+                # MuJoCo-based robots (SO101FollowerEndEffector) handle EE pose internally
+                if hasattr(robot.config, 'urdf_path') and robot.config.urdf_path is not None:
+                    env = EEObservationWrapper(env=env, ee_pose_limits=robot.end_effector_bounds)
 
     env = ConvertToLeRobotObservation(env=env, device=cfg.device)
 

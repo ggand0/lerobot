@@ -79,17 +79,25 @@ class TrainPipelineConfig(HubMixin):
             # The entire train config is already loaded, we just need to get the checkpoint dir
             config_path = parser.parse_arg("config_path")
             if not config_path:
-                raise ValueError(
-                    f"A config_path is expected when resuming a run. Please specify path to {TRAIN_CONFIG_NAME}"
-                )
-            if not Path(config_path).resolve().exists():
-                raise NotADirectoryError(
-                    f"{config_path=} is expected to be a local path. "
-                    "Resuming from the hub is not supported for now."
-                )
-            policy_path = Path(config_path).parent
-            self.policy.pretrained_path = policy_path
-            self.checkpoint_path = policy_path.parent
+                # No config_path provided - check if output_dir has a train_config.json
+                if self.output_dir and Path(self.output_dir, TRAIN_CONFIG_NAME).exists():
+                    config_path = str(Path(self.output_dir, TRAIN_CONFIG_NAME))
+                else:
+                    # No config found, but resume=True just means "don't error on existing dir"
+                    # The learner/actor will handle initialization appropriately
+                    pass
+            if config_path:
+                if not Path(config_path).resolve().exists():
+                    raise NotADirectoryError(
+                        f"{config_path=} is expected to be a local path. "
+                        "Resuming from the hub is not supported for now."
+                    )
+                policy_path = Path(config_path).parent
+                # Only set pretrained_path if there's actually a model file there
+                model_file = policy_path / "model.safetensors"
+                if model_file.exists():
+                    self.policy.pretrained_path = policy_path
+                    self.checkpoint_path = policy_path.parent
 
         if not self.job_name:
             if self.env is None:
