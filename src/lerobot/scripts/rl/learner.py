@@ -1042,16 +1042,18 @@ def initialize_offline_replay_buffer(
         return offline_replay_buffer
 
     # No cache - need to convert from dataset
-    if not cfg.resume:
-        logging.info("make_dataset offline buffer")
-        offline_dataset = make_dataset(cfg)
-    else:
-        logging.info("load offline dataset")
-        dataset_offline_path = os.path.join(cfg.output_dir, "dataset_offline")
+    # Check if local dataset exists (for resume), otherwise download from hub
+    dataset_offline_path = os.path.join(cfg.output_dir, "dataset_offline")
+    if cfg.resume and os.path.exists(dataset_offline_path):
+        logging.info("load offline dataset from local path")
         offline_dataset = LeRobotDataset(
             repo_id=cfg.dataset.repo_id,
             root=dataset_offline_path,
+            video_backend=cfg.dataset.video_backend,
         )
+    else:
+        logging.info("make_dataset offline buffer (downloading from hub)")
+        offline_dataset = make_dataset(cfg)
 
     logging.info("Convert to a offline replay buffer")
     # Get image resize size from env config if available
