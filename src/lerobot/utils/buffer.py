@@ -599,6 +599,96 @@ class ReplayBuffer:
 
         return replay_buffer
 
+    def save(self, path: str) -> None:
+        """
+        Save the replay buffer to disk.
+
+        Args:
+            path: Path to save the buffer (without extension, will create .pt file)
+        """
+        if not self.initialized:
+            raise RuntimeError("Cannot save an uninitialized buffer.")
+
+        save_dict = {
+            "states": self.states,
+            "actions": self.actions,
+            "rewards": self.rewards,
+            "dones": self.dones,
+            "truncateds": self.truncateds,
+            "episode_ends": self.episode_ends,
+            "position": self.position,
+            "size": self.size,
+            "capacity": self.capacity,
+            "state_keys": list(self.state_keys),  # Convert to list for pickling
+            "optimize_memory": self.optimize_memory,
+            "has_complementary_info": self.has_complementary_info,
+            "complementary_info_keys": self.complementary_info_keys,
+            "complementary_info": self.complementary_info if self.has_complementary_info else {},
+        }
+
+        # Only save next_states if not using memory optimization
+        if not self.optimize_memory:
+            save_dict["next_states"] = self.next_states
+
+        torch.save(save_dict, f"{path}.pt")
+
+    @classmethod
+    def load(
+        cls,
+        path: str,
+        device: str = "cuda:0",
+        storage_device: str = "cpu",
+        image_augmentation_function=None,
+        use_drq: bool = True,
+    ) -> "ReplayBuffer":
+        """
+        Load a replay buffer from disk.
+
+        Args:
+            path: Path to the saved buffer (without .pt extension)
+            device: Device for sampling tensors
+            storage_device: Device for storage (ignored, uses saved device)
+            image_augmentation_function: Optional augmentation function
+            use_drq: Whether to use DrQ augmentation
+
+        Returns:
+            ReplayBuffer: Loaded replay buffer
+        """
+        save_dict = torch.load(f"{path}.pt", weights_only=False)
+
+        # Create buffer with saved configuration
+        replay_buffer = cls(
+            capacity=save_dict["capacity"],
+            device=device,
+            state_keys=save_dict["state_keys"],
+            image_augmentation_function=image_augmentation_function,
+            use_drq=use_drq,
+            storage_device=storage_device,
+            optimize_memory=save_dict["optimize_memory"],
+        )
+
+        # Restore state
+        replay_buffer.states = save_dict["states"]
+        replay_buffer.actions = save_dict["actions"]
+        replay_buffer.rewards = save_dict["rewards"]
+        replay_buffer.dones = save_dict["dones"]
+        replay_buffer.truncateds = save_dict["truncateds"]
+        replay_buffer.episode_ends = save_dict["episode_ends"]
+        replay_buffer.position = save_dict["position"]
+        replay_buffer.size = save_dict["size"]
+        replay_buffer.has_complementary_info = save_dict["has_complementary_info"]
+        replay_buffer.complementary_info_keys = save_dict["complementary_info_keys"]
+        replay_buffer.complementary_info = save_dict["complementary_info"]
+
+        if not save_dict["optimize_memory"]:
+            replay_buffer.next_states = save_dict["next_states"]
+        else:
+            replay_buffer.next_states = replay_buffer.states
+
+        replay_buffer.initialized = True
+
+        return replay_buffer
+
     def to_lerobot_dataset(
         self,
         repo_id: str,
