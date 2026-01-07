@@ -627,7 +627,7 @@ class ReplayBuffer:
             "position": self.position,
             "size": self.size,
             "capacity": self.capacity,
-            "state_keys": self.state_keys,
+            "state_keys": list(self.state_keys),  # Convert to list for pickling
             "optimize_memory": self.optimize_memory,
             "has_complementary_info": self.has_complementary_info,
             "complementary_info_keys": self.complementary_info_keys,
