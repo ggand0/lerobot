@@ -442,6 +442,9 @@ class ReplayBuffer:
         mujoco_model_path: str | None = None,
         ee_site_name: str = "gripper",
         fps: float = 30.0,
+        convert_actions_to_ee: bool = False,
+        ee_action_scale: float = 0.02,
+        target_action_dim: int | None = None,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -464,6 +467,9 @@ class ReplayBuffer:
             mujoco_model_path (str | None): Path to MuJoCo model for FK computation.
             ee_site_name (str): End-effector site name in MuJoCo model.
             fps (float): Dataset FPS for velocity computation.
+            convert_actions_to_ee (bool): If True, convert joint actions to EE delta actions.
+            ee_action_scale (float): Scale for EE delta actions (to denormalize).
+            target_action_dim (int | None): Target action dimension (e.g., 4 for xyz+gripper).
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
@@ -501,10 +507,11 @@ class ReplayBuffer:
         dt = 1.0 / fps
         prev_joint_pos = None
 
-        if compute_full_proprioception:
+        # Initialize MuJoCo if needed for full proprioception or action conversion
+        if compute_full_proprioception or convert_actions_to_ee:
             if mujoco_model_path is None:
                 raise ValueError(
-                    "mujoco_model_path must be provided when compute_full_proprioception=True"
+                    "mujoco_model_path must be provided when compute_full_proprioception=True or convert_actions_to_ee=True"
                 )
             import mujoco
             mj_model = mujoco.MjModel.from_xml_path(mujoco_model_path)
@@ -513,6 +520,8 @@ class ReplayBuffer:
             if ee_site_id < 0:
                 raise ValueError(f"Site '{ee_site_name}' not found in MuJoCo model")
             print(f"Initialized MuJoCo FK from {mujoco_model_path} (site: {ee_site_name})")
+            if convert_actions_to_ee:
+                print(f"Converting actions to EE space (scale: {ee_action_scale}, target_dim: {target_action_dim})")
 
         # Check dataset features from first sample
         sample = lerobot_dataset[0]
@@ -530,6 +539,7 @@ class ReplayBuffer:
         prev_sample = None
         prev_state = None
         prev_episode_idx = None
+        prev_ee_pos = None  # For action conversion
 
         for i in tqdm(range(num_frames), desc="Converting dataset to replay buffer"):
             current_sample = lerobot_dataset[i]
@@ -599,7 +609,52 @@ class ReplayBuffer:
                     next_state = current_state
 
                 # Get action
-                action = prev_sample["action"].unsqueeze(0).to(storage_device)
+                action = prev_sample["action"]
+
+                # Convert joint actions to EE delta actions if requested
+                if convert_actions_to_ee and mj_model is not None:
+                    import mujoco
+                    # Get joint positions from prev and current observation.state
+                    prev_joints = prev_sample["observation.state"].numpy()[:6]
+                    curr_joints = current_sample["observation.state"].numpy()[:6]
+
+                    # Compute EE positions via FK
+                    prev_joints_rad = np.deg2rad(prev_joints)
+                    mj_data.qpos[:6] = prev_joints_rad
+                    mujoco.mj_forward(mj_model, mj_data)
+                    prev_ee = mj_data.site_xpos[ee_site_id].copy()
+
+                    curr_joints_rad = np.deg2rad(curr_joints)
+                    mj_data.qpos[:6] = curr_joints_rad
+                    mujoco.mj_forward(mj_model, mj_data)
+                    curr_ee = mj_data.site_xpos[ee_site_id].copy()
+
+                    # EE delta (unnormalized)
+                    ee_delta = curr_ee - prev_ee
+
+                    # Normalize by action scale to get action in [-1, 1] range
+                    ee_delta_normalized = ee_delta / ee_action_scale
+
+                    # Clip to [-1, 1]
+                    ee_delta_normalized = np.clip(ee_delta_normalized, -1.0, 1.0)
+
+                    # Gripper action: use change in gripper joint (last joint)
+                    # Normalize gripper: typical range is 0-100 degrees, map to [-1, 1]
+                    gripper_val = action[-1].item()  # Get gripper from action
+                    gripper_normalized = (gripper_val / 50.0) - 1.0  # 0->-1, 100->1
+                    gripper_normalized = np.clip(gripper_normalized, -1.0, 1.0)
+
+                    # Construct 4-dim EE action: [dx, dy, dz, gripper]
+                    ee_action = np.array([
+                        ee_delta_normalized[0],
+                        ee_delta_normalized[1],
+                        ee_delta_normalized[2],
+                        gripper_normalized
+                    ], dtype=np.float32)
+
+                    action = torch.from_numpy(ee_action)
+
+                action = action.unsqueeze(0).to(storage_device)
 
                 # Get complementary info
                 complementary_info = None
