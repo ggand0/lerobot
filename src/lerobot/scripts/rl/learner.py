@@ -1029,6 +1029,14 @@ def initialize_offline_replay_buffer(
         )
 
     logging.info("Convert to a offline replay buffer")
+    # Get image resize size from env config if available
+    image_size = None
+    if hasattr(cfg, "env") and hasattr(cfg.env, "wrapper") and hasattr(cfg.env.wrapper, "resize_size"):
+        resize_size = cfg.env.wrapper.resize_size
+        if resize_size is not None:
+            image_size = tuple(resize_size)
+            logging.info(f"Resizing images to {image_size} during buffer conversion")
+
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
@@ -1036,6 +1044,7 @@ def initialize_offline_replay_buffer(
         storage_device=storage_device,
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
+        image_size=image_size,
     )
 
     # Save to cache for future runs

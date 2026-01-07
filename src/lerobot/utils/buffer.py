@@ -421,6 +421,7 @@ class ReplayBuffer:
         use_drq: bool = True,
         storage_device: str = "cpu",
         optimize_memory: bool = False,
+        image_size: tuple[int, int] | None = None,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -438,6 +439,7 @@ class ReplayBuffer:
             use_drq (bool): Whether to use DrQ image augmentation when sampling.
             storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
             optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
+            image_size (tuple[int, int] | None): Target size (H, W) to resize images. If None, no resize.
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
@@ -493,6 +495,12 @@ class ReplayBuffer:
             current_state: dict[str, torch.Tensor] = {}
             for key in state_keys:
                 val = current_sample[key]
+                # Resize images if image_size is specified
+                if image_size is not None and val.ndim == 3 and val.shape[0] in (1, 3, 4):
+                    # Assume CHW format for images
+                    val = F.interpolate(
+                        val.unsqueeze(0), size=image_size, mode="bilinear", align_corners=False
+                    ).squeeze(0)
                 current_state[key] = val.unsqueeze(0).to(storage_device)
 
             # Process previous sample now that we have current (for next_state)
