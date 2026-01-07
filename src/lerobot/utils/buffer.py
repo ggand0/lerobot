@@ -425,6 +425,8 @@ class ReplayBuffer:
         """
         Convert a LeRobotDataset into a ReplayBuffer.
 
+        Uses streaming to avoid loading all transitions into memory at once.
+
         Args:
             lerobot_dataset (LeRobotDataset): The dataset to convert.
             device (str): The device for sampling tensors. Defaults to "cuda:0".
@@ -440,6 +442,9 @@ class ReplayBuffer:
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
         """
+        if state_keys is None:
+            raise ValueError("State keys must be provided when converting LeRobotDataset to ReplayBuffer.")
+
         if capacity is None:
             capacity = len(lerobot_dataset)
 
@@ -459,48 +464,137 @@ class ReplayBuffer:
             optimize_memory=optimize_memory,
         )
 
-        # Convert dataset to transitions
-        list_transition = cls._lerobotdataset_to_transitions(dataset=lerobot_dataset, state_keys=state_keys)
+        num_frames = len(lerobot_dataset)
+        if num_frames == 0:
+            return replay_buffer
 
-        # Initialize the buffer with the first transition to set up storage tensors
-        if list_transition:
-            first_transition = list_transition[0]
-            first_state = {k: v.to(device) for k, v in first_transition["state"].items()}
-            first_action = first_transition["action"].to(device)
+        # Check dataset features from first sample
+        sample = lerobot_dataset[0]
+        has_done_key = "next.done" in sample
+        has_reward_key = "next.reward" in sample
+        complementary_info_keys = [key for key in sample if key.startswith("complementary_info.")]
+        has_complementary_info = len(complementary_info_keys) > 0
 
-            # Get complementary info if available
-            first_complementary_info = None
-            if (
-                "complementary_info" in first_transition
-                and first_transition["complementary_info"] is not None
-            ):
-                first_complementary_info = {
-                    k: v.to(device) for k, v in first_transition["complementary_info"].items()
-                }
+        if not has_done_key:
+            print("'next.done' key not found in dataset. Inferring from episode boundaries...")
+        if not has_reward_key:
+            print("'next.reward' key not found in dataset. Using 0.0 as default reward...")
 
-            replay_buffer._initialize_storage(
-                state=first_state, action=first_action, complementary_info=first_complementary_info
-            )
+        # Stream through dataset - only keep current and next sample in memory
+        prev_sample = None
+        prev_state = None
+        prev_episode_idx = None
 
-        # Fill the buffer with all transitions
-        for data in list_transition:
-            for k, v in data.items():
-                if isinstance(v, dict):
-                    for key, tensor in v.items():
-                        v[key] = tensor.to(storage_device)
-                elif isinstance(v, torch.Tensor):
-                    data[k] = v.to(storage_device)
+        for i in tqdm(range(num_frames), desc="Converting dataset to replay buffer"):
+            current_sample = lerobot_dataset[i]
+            current_episode_idx = current_sample["episode_index"].item()
 
-            action = data["action"]
+            # Build current state
+            current_state: dict[str, torch.Tensor] = {}
+            for key in state_keys:
+                val = current_sample[key]
+                current_state[key] = val.unsqueeze(0).to(storage_device)
+
+            # Process previous sample now that we have current (for next_state)
+            if prev_sample is not None:
+                # Determine if previous frame was done
+                if has_done_key:
+                    done = bool(prev_sample["next.done"].item())
+                else:
+                    # Done if episode changed
+                    done = prev_episode_idx != current_episode_idx
+
+                # Get reward
+                if has_reward_key:
+                    reward = float(prev_sample["next.reward"].item())
+                else:
+                    reward = 0.0
+
+                # next_state is current_state if same episode, else prev_state
+                if done:
+                    next_state = prev_state
+                else:
+                    next_state = current_state
+
+                # Get action
+                action = prev_sample["action"].unsqueeze(0).to(storage_device)
+
+                # Get complementary info
+                complementary_info = None
+                if has_complementary_info:
+                    complementary_info = {}
+                    for key in complementary_info_keys:
+                        short_key = key.replace("complementary_info.", "")
+                        val = prev_sample[key]
+                        if val.ndim == 0:
+                            val = val.unsqueeze(0)
+                        complementary_info[short_key] = val.to(storage_device)
+
+                # Initialize storage on first transition
+                if not replay_buffer.initialized:
+                    init_state = {k: v.to(device) for k, v in prev_state.items()}
+                    init_action = action.to(device)
+                    init_comp_info = None
+                    if complementary_info:
+                        init_comp_info = {k: v.to(device) for k, v in complementary_info.items()}
+                    replay_buffer._initialize_storage(
+                        state=init_state, action=init_action, complementary_info=init_comp_info
+                    )
+
+                # Add transition
+                replay_buffer.add(
+                    state=prev_state,
+                    action=action,
+                    reward=reward,
+                    next_state=next_state,
+                    done=done,
+                    truncated=False,
+                    complementary_info=complementary_info,
+                )
+
+            # Shift current to previous
+            prev_sample = current_sample
+            prev_state = current_state
+            prev_episode_idx = current_episode_idx
+
+        # Handle last frame (always done)
+        if prev_sample is not None:
+            if has_reward_key:
+                reward = float(prev_sample["next.reward"].item())
+            else:
+                reward = 0.0
+
+            action = prev_sample["action"].unsqueeze(0).to(storage_device)
+
+            complementary_info = None
+            if has_complementary_info:
+                complementary_info = {}
+                for key in complementary_info_keys:
+                    short_key = key.replace("complementary_info.", "")
+                    val = prev_sample[key]
+                    if val.ndim == 0:
+                        val = val.unsqueeze(0)
+                    complementary_info[short_key] = val.to(storage_device)
+
+            # Initialize if this is the only frame
+            if not replay_buffer.initialized:
+                init_state = {k: v.to(device) for k, v in prev_state.items()}
+                init_action = action.to(device)
+                init_comp_info = None
+                if complementary_info:
+                    init_comp_info = {k: v.to(device) for k, v in complementary_info.items()}
+                replay_buffer._initialize_storage(
+                    state=init_state, action=init_action, complementary_info=init_comp_info
+                )
 
             replay_buffer.add(
-                state=data["state"],
+                state=prev_state,
                 action=action,
-                reward=data["reward"],
-                next_state=data["next_state"],
-                done=data["done"],
-                truncated=False,  # NOTE: Truncation are not supported yet in lerobot dataset
-                complementary_info=data.get("complementary_info", None),
+                reward=reward,
+                next_state=prev_state,  # Last frame's next_state is itself
+                done=True,
+                truncated=False,
+                complementary_info=complementary_info,
             )
 
         return replay_buffer
