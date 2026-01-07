@@ -1080,21 +1080,50 @@ def initialize_offline_replay_buffer(
     if hasattr(cfg, "env") and hasattr(cfg.env, "wrapper"):
         compute_full_proprioception = getattr(cfg.env.wrapper, "add_full_proprioception", False)
 
-    if compute_full_proprioception:
-        # Get MuJoCo model path from robot config
-        if hasattr(cfg.env, "robot"):
-            robot_cfg = cfg.env.robot
-            # Try both direct access and nested config
-            mujoco_model_path = getattr(robot_cfg, "mujoco_model_path", None)
-            if mujoco_model_path is None and hasattr(robot_cfg, "config"):
-                mujoco_model_path = getattr(robot_cfg.config, "mujoco_model_path", None)
-            ee_site_name = getattr(robot_cfg, "end_effector_site", None)
-            if ee_site_name is None and hasattr(robot_cfg, "config"):
-                ee_site_name = getattr(robot_cfg.config, "end_effector_site", "gripper")
-            if ee_site_name is None:
-                ee_site_name = "gripper"
+    # Get MuJoCo model path from robot config (needed for full proprioception and action conversion)
+    if hasattr(cfg, "env") and hasattr(cfg.env, "robot"):
+        robot_cfg = cfg.env.robot
+        # Try both direct access and nested config
+        mujoco_model_path = getattr(robot_cfg, "mujoco_model_path", None)
+        if mujoco_model_path is None and hasattr(robot_cfg, "config"):
+            mujoco_model_path = getattr(robot_cfg.config, "mujoco_model_path", None)
+        ee_site_name = getattr(robot_cfg, "end_effector_site", None)
+        if ee_site_name is None and hasattr(robot_cfg, "config"):
+            ee_site_name = getattr(robot_cfg.config, "end_effector_site", "gripper")
+        if ee_site_name is None:
+            ee_site_name = "gripper"
+
+    if hasattr(cfg, "env"):
         fps = getattr(cfg.env, "fps", 30.0)
+
+    if compute_full_proprioception:
         logging.info(f"Computing full proprioception with MuJoCo FK (model: {mujoco_model_path}, site: {ee_site_name})")
+
+    # Check if action conversion is needed (dataset has joint actions but policy expects EE actions)
+    convert_actions_to_ee = False
+    ee_action_scale = 0.02
+    target_action_dim = None
+
+    # Get policy action dim
+    policy_action_dim = None
+    if hasattr(cfg.policy, "output_features") and "action" in cfg.policy.output_features:
+        policy_action_shape = cfg.policy.output_features["action"].get("shape", None)
+        if policy_action_shape:
+            policy_action_dim = policy_action_shape[0] if isinstance(policy_action_shape, (list, tuple)) else policy_action_shape
+
+    # Get dataset action dim
+    dataset_action_dim = offline_dataset[0]["action"].shape[0] if len(offline_dataset) > 0 else None
+
+    if policy_action_dim and dataset_action_dim and policy_action_dim != dataset_action_dim:
+        logging.info(f"Action dimension mismatch: dataset={dataset_action_dim}, policy={policy_action_dim}")
+        # If policy expects 4-dim (EE) and dataset has 6-dim (joints), convert
+        if policy_action_dim == 4 and dataset_action_dim == 6:
+            convert_actions_to_ee = True
+            target_action_dim = policy_action_dim
+            # Get action scale from robot config
+            if hasattr(cfg.env, "robot"):
+                ee_action_scale = getattr(cfg.env.robot, "action_scale", 0.02)
+            logging.info(f"Converting joint actions to EE actions (scale: {ee_action_scale})")
 
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
@@ -1108,6 +1137,9 @@ def initialize_offline_replay_buffer(
         mujoco_model_path=mujoco_model_path,
         ee_site_name=ee_site_name,
         fps=fps,
+        convert_actions_to_ee=convert_actions_to_ee,
+        ee_action_scale=ee_action_scale,
+        target_action_dim=target_action_dim,
     )
 
     # Save to cache for future runs
