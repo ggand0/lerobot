@@ -46,13 +46,18 @@ class SO101FollowerConfig(RobotConfig):
 class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
     """Configuration for the SO101FollowerEndEffector robot."""
 
-    # Path to URDF file for kinematics
-    # NOTE: It is highly recommended to use the urdf in the SO-ARM100 repo:
-    # https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf
-    urdf_path: str | None = None
+    # Path to MuJoCo XML model for kinematics (required for IK)
+    mujoco_model_path: str | None = None
 
-    # End-effector frame name in the URDF
-    target_frame_name: str = "gripper_frame_link"
+    # End-effector site name in MuJoCo model
+    end_effector_site: str = "gripperframe"
+
+    # IK parameters
+    ik_damping: float = 0.1  # Damping for singularity robustness
+    ik_max_dq: float = 0.5  # Max joint velocity per step (radians)
+
+    # Joints to lock during IK (0=shoulder_pan, 1=shoulder_lift, 2=elbow_flex, 3=wrist_flex, 4=wrist_roll)
+    locked_joints: list[int] = field(default_factory=lambda: [4])  # Lock wrist_roll by default
 
     # Default bounds for the end-effector position (in meters)
     end_effector_bounds: dict[str, list[float]] = field(
@@ -64,10 +69,5 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
 
     max_gripper_pos: float = 50
 
-    end_effector_step_sizes: dict[str, float] = field(
-        default_factory=lambda: {
-            "x": 0.02,
-            "y": 0.02,
-            "z": 0.02,
-        }
-    )
+    # Action scale: meters per action unit (same as sim training)
+    action_scale: float = 0.02

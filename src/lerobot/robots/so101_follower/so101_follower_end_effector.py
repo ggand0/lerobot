@@ -16,13 +16,14 @@
 
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
+import mujoco
 import numpy as np
 
 from lerobot.cameras import make_cameras_from_configs
 from lerobot.errors import DeviceNotConnectedError
-from lerobot.model.kinematics import RobotKinematics
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.motors.feetech import FeetechMotorsBus
 
@@ -34,14 +35,18 @@ logger = logging.getLogger(__name__)
 
 class SO101FollowerEndEffector(SO101Follower):
     """
-    SO101Follower robot with end-effector space control.
+    SO101Follower robot with end-effector space control using MuJoCo IK.
 
     This robot inherits from SO101Follower but transforms actions from
-    end-effector space to joint space before sending them to the motors.
+    end-effector space to joint space using MuJoCo's damped least-squares IK.
     """
 
     config_class = SO101FollowerEndEffectorConfig
     name = "so101_follower_end_effector"
+
+    # Joint order in MuJoCo model (degrees)
+    JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+    N_ARM_JOINTS = 5
 
     def __init__(self, config: SO101FollowerEndEffectorConfig):
         super().__init__(config)
@@ -60,26 +65,107 @@ class SO101FollowerEndEffector(SO101Follower):
         )
 
         self.cameras = make_cameras_from_configs(config.cameras)
-
         self.config = config
 
-        # Initialize the kinematics module for the so101 robot
-        if self.config.urdf_path is None:
+        # Initialize MuJoCo model for IK
+        if self.config.mujoco_model_path is None:
             raise ValueError(
-                "urdf_path must be provided in the configuration for end-effector control. "
-                "Please set urdf_path in your SO101FollowerEndEffectorConfig."
+                "mujoco_model_path must be provided in the configuration for end-effector control. "
+                "Please set mujoco_model_path in your SO101FollowerEndEffectorConfig."
             )
 
-        self.kinematics = RobotKinematics(
-            urdf_path=self.config.urdf_path,
-            target_frame_name=self.config.target_frame_name,
-        )
+        model_path = Path(self.config.mujoco_model_path)
+        if not model_path.exists():
+            raise FileNotFoundError(f"MuJoCo model not found: {model_path}")
 
-        # Store the bounds for end-effector position
+        self.mj_model = mujoco.MjModel.from_xml_path(str(model_path))
+        self.mj_data = mujoco.MjData(self.mj_model)
+
+        # Get end-effector site ID
+        self.ee_site_id = mujoco.mj_name2id(
+            self.mj_model, mujoco.mjtObj.mjOBJ_SITE, self.config.end_effector_site
+        )
+        if self.ee_site_id == -1:
+            raise ValueError(f"Site '{self.config.end_effector_site}' not found in MuJoCo model")
+
+        # Pre-allocate Jacobians
+        self.jacp = np.zeros((3, self.mj_model.nv))
+        self.jacr = np.zeros((3, self.mj_model.nv))
+
+        # Joint limits from model (radians)
+        self.joint_limits_lower = np.array([self.mj_model.jnt_range[i, 0] for i in range(self.N_ARM_JOINTS)])
+        self.joint_limits_upper = np.array([self.mj_model.jnt_range[i, 1] for i in range(self.N_ARM_JOINTS)])
+
+        # Store bounds for end-effector position
         self.end_effector_bounds = self.config.end_effector_bounds
 
-        self.current_ee_pos = None
-        self.current_joint_pos = None
+        logger.info(f"Initialized MuJoCo IK with model: {model_path}")
+        logger.info(f"EE site: {self.config.end_effector_site} (id={self.ee_site_id})")
+        logger.info(f"Locked joints: {self.config.locked_joints}")
+
+    def _sync_mujoco(self, joint_positions_rad: np.ndarray):
+        """Sync MuJoCo model state with joint positions (radians)."""
+        n_joints = min(len(joint_positions_rad), self.N_ARM_JOINTS)
+        self.mj_data.qpos[:n_joints] = joint_positions_rad[:n_joints]
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+    def _get_ee_position(self) -> np.ndarray:
+        """Get current end-effector position from MuJoCo model."""
+        return self.mj_data.site_xpos[self.ee_site_id].copy()
+
+    def _compute_ik(
+        self,
+        target_pos: np.ndarray,
+        current_joints_rad: np.ndarray,
+    ) -> np.ndarray:
+        """Compute target joint positions using damped least-squares IK.
+
+        Args:
+            target_pos: Target end-effector position (3,) in meters.
+            current_joints_rad: Current joint positions (5,) in radians.
+
+        Returns:
+            Target joint positions (5,) in radians.
+        """
+        # Sync model with current joints
+        self._sync_mujoco(current_joints_rad)
+
+        # Position error
+        current_pos = self._get_ee_position()
+        pos_error = target_pos - current_pos
+
+        # Compute Jacobian
+        mujoco.mj_jacSite(
+            self.mj_model, self.mj_data, self.jacp, self.jacr, self.ee_site_id
+        )
+
+        # Active joints (exclude locked ones)
+        locked = self.config.locked_joints or []
+        active_joints = [i for i in range(self.N_ARM_JOINTS) if i not in locked]
+        n_active = len(active_joints)
+        Jp = self.jacp[:, active_joints]
+
+        # Damped least-squares
+        JTJ = Jp.T @ Jp
+        damping_matrix = self.config.ik_damping ** 2 * np.eye(n_active)
+
+        try:
+            dq_active = np.linalg.solve(JTJ + damping_matrix, Jp.T @ pos_error)
+        except np.linalg.LinAlgError:
+            dq_active = np.linalg.pinv(Jp) @ pos_error
+
+        # Clamp velocity
+        dq_active = np.clip(dq_active, -self.config.ik_max_dq, self.config.ik_max_dq)
+
+        # Build target joint positions
+        target_joints = current_joints_rad.copy()
+        for i, joint_idx in enumerate(active_joints):
+            target_joints[joint_idx] += dq_active[i]
+
+        # Clamp to joint limits
+        target_joints = np.clip(target_joints, self.joint_limits_lower, self.joint_limits_upper)
+
+        return target_joints
 
     @property
     def action_features(self) -> dict[str, Any]:
@@ -95,20 +181,19 @@ class SO101FollowerEndEffector(SO101Follower):
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """
-        Transform action from end-effector space to joint space and send to motors.
+        Transform action from end-effector space to joint space using MuJoCo IK.
 
         Args:
             action: Dictionary with keys 'delta_x', 'delta_y', 'delta_z' for end-effector control
-                   or a numpy array with [delta_x, delta_y, delta_z]
+                   or a numpy array with [delta_x, delta_y, delta_z, gripper]
 
         Returns:
             The joint-space action that was sent to the motors
         """
-
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        # Convert action to numpy array if not already
+        # Convert action to numpy array if dict
         if isinstance(action, dict):
             # Check if this is a joint-space action (from teleoperation)
             joint_keys = [f"{motor}.pos" for motor in self.bus.motors]
@@ -116,69 +201,59 @@ class SO101FollowerEndEffector(SO101Follower):
                 # Pass through joint-space actions directly to parent class
                 return SO101Follower.send_action(self, action)
             elif all(k in action for k in ["delta_x", "delta_y", "delta_z"]):
-                delta_ee = np.array(
-                    [
-                        action["delta_x"] * self.config.end_effector_step_sizes["x"],
-                        action["delta_y"] * self.config.end_effector_step_sizes["y"],
-                        action["delta_z"] * self.config.end_effector_step_sizes["z"],
-                    ],
+                delta_xyz = np.array(
+                    [action["delta_x"], action["delta_y"], action["delta_z"]],
                     dtype=np.float32,
                 )
-                if "gripper" not in action:
-                    action["gripper"] = [1.0]
-                action = np.append(delta_ee, action["gripper"])
+                gripper = action.get("gripper", 1.0)
+                action = np.append(delta_xyz, gripper)
             else:
                 logger.warning(
                     f"Expected action keys 'delta_x', 'delta_y', 'delta_z' or joint keys, got {list(action.keys())}"
                 )
                 action = np.zeros(4, dtype=np.float32)
 
-        if self.current_joint_pos is None:
-            # Read current joint positions
-            current_joint_pos = self.bus.sync_read("Present_Position")
-            self.current_joint_pos = np.array([current_joint_pos[name] for name in self.bus.motors])
+        # ALWAYS read current joint positions from robot (not cached)
+        # Caching causes internal state to diverge from reality
+        current_pos_dict = self.bus.sync_read("Present_Position")
+        current_joints_deg = np.array([current_pos_dict[name] for name in self.JOINT_NAMES])
+        current_joints_rad = np.deg2rad(current_joints_deg)
 
-        # Calculate current end-effector position using forward kinematics
-        if self.current_ee_pos is None:
-            self.current_ee_pos = self.kinematics.forward_kinematics(self.current_joint_pos)
+        # Get current EE position from MuJoCo FK
+        self._sync_mujoco(current_joints_rad)
+        current_ee_pos = self._get_ee_position()
 
-        # Set desired end-effector position by adding delta
-        desired_ee_pos = np.eye(4)
-        desired_ee_pos[:3, :3] = self.current_ee_pos[:3, :3]  # Keep orientation
+        # Compute target EE position
+        delta_xyz = action[:3] * self.config.action_scale
+        target_ee_pos = current_ee_pos + delta_xyz
 
-        # Add delta to position and clip to bounds
-        desired_ee_pos[:3, 3] = self.current_ee_pos[:3, 3] + action[:3]
+        # Apply bounds
         if self.end_effector_bounds is not None:
-            desired_ee_pos[:3, 3] = np.clip(
-                desired_ee_pos[:3, 3],
+            target_ee_pos = np.clip(
+                target_ee_pos,
                 self.end_effector_bounds["min"],
                 self.end_effector_bounds["max"],
             )
 
-        # Compute inverse kinematics to get joint positions
-        target_joint_values_in_degrees = self.kinematics.inverse_kinematics(
-            self.current_joint_pos, desired_ee_pos
-        )
+        # Compute IK to get target joint positions (radians)
+        target_joints_rad = self._compute_ik(target_ee_pos, current_joints_rad)
+        target_joints_deg = np.rad2deg(target_joints_rad)
 
-        # Create joint space action dictionary
+        # Build joint action dict
         joint_action = {
-            f"{key}.pos": target_joint_values_in_degrees[i] for i, key in enumerate(self.bus.motors.keys())
+            f"{name}.pos": target_joints_deg[i] for i, name in enumerate(self.JOINT_NAMES)
         }
 
-        # Handle gripper separately if included in action
-        # Gripper delta action is in the range 0 - 2,
-        # We need to shift the action to the range -1, 1 so that we can expand it to -Max_gripper_pos, Max_gripper_pos
+        # Handle gripper (action in [0, 2] where 1 = no-op)
+        current_gripper = current_pos_dict["gripper"]
+        gripper_delta = (action[-1] - 1) * self.config.max_gripper_pos
         joint_action["gripper.pos"] = np.clip(
-            self.current_joint_pos[-1] + (action[-1] - 1) * self.config.max_gripper_pos,
+            current_gripper + gripper_delta,
             5,
             self.config.max_gripper_pos,
         )
 
-        self.current_ee_pos = desired_ee_pos.copy()
-        self.current_joint_pos = target_joint_values_in_degrees.copy()
-        self.current_joint_pos[-1] = joint_action["gripper.pos"]
-
-        # Send joint space action to parent class
+        # Send to parent class
         return super().send_action(joint_action)
 
     def get_observation(self) -> dict[str, Any]:
@@ -202,5 +277,5 @@ class SO101FollowerEndEffector(SO101Follower):
         return obs_dict
 
     def reset(self):
-        self.current_ee_pos = None
-        self.current_joint_pos = None
+        """Reset internal state."""
+        pass  # No cached state to reset anymore
