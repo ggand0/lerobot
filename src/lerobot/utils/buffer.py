@@ -19,12 +19,28 @@ from collections.abc import Callable, Sequence
 from contextlib import suppress
 from typing import TypedDict
 
+import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.transition import Transition
+
+
+def rotation_matrix_to_euler(R: np.ndarray) -> np.ndarray:
+    """Convert rotation matrix to euler angles (XYZ convention)."""
+    sy = np.sqrt(R[0, 0] ** 2 + R[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        x = np.arctan2(R[2, 1], R[2, 2])
+        y = np.arctan2(-R[2, 0], sy)
+        z = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        x = np.arctan2(-R[1, 2], R[1, 1])
+        y = np.arctan2(-R[2, 0], sy)
+        z = 0
+    return np.array([x, y, z])
 
 
 class BatchTransition(TypedDict):
@@ -422,6 +438,10 @@ class ReplayBuffer:
         storage_device: str = "cpu",
         optimize_memory: bool = False,
         image_size: tuple[int, int] | None = None,
+        compute_full_proprioception: bool = False,
+        mujoco_model_path: str | None = None,
+        ee_site_name: str = "gripper",
+        fps: float = 30.0,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -440,6 +460,10 @@ class ReplayBuffer:
             storage_device (str): Device for storing tensor data. Using "cpu" saves GPU memory.
             optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
             image_size (tuple[int, int] | None): Target size (H, W) to resize images. If None, no resize.
+            compute_full_proprioception (bool): If True, expand state to 18-dim with vel and FK.
+            mujoco_model_path (str | None): Path to MuJoCo model for FK computation.
+            ee_site_name (str): End-effector site name in MuJoCo model.
+            fps (float): Dataset FPS for velocity computation.
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
@@ -469,6 +493,26 @@ class ReplayBuffer:
         num_frames = len(lerobot_dataset)
         if num_frames == 0:
             return replay_buffer
+
+        # Initialize MuJoCo for FK computation if computing full proprioception
+        mj_model = None
+        mj_data = None
+        ee_site_id = None
+        dt = 1.0 / fps
+        prev_joint_pos = None
+
+        if compute_full_proprioception:
+            if mujoco_model_path is None:
+                raise ValueError(
+                    "mujoco_model_path must be provided when compute_full_proprioception=True"
+                )
+            import mujoco
+            mj_model = mujoco.MjModel.from_xml_path(mujoco_model_path)
+            mj_data = mujoco.MjData(mj_model)
+            ee_site_id = mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, ee_site_name)
+            if ee_site_id < 0:
+                raise ValueError(f"Site '{ee_site_name}' not found in MuJoCo model")
+            print(f"Initialized MuJoCo FK from {mujoco_model_path} (site: {ee_site_name})")
 
         # Check dataset features from first sample
         sample = lerobot_dataset[0]
@@ -501,6 +545,36 @@ class ReplayBuffer:
                     val = F.interpolate(
                         val.unsqueeze(0), size=image_size, mode="bilinear", align_corners=False
                     ).squeeze(0)
+
+                # Compute full proprioception for observation.state
+                if compute_full_proprioception and key == "observation.state" and mj_model is not None:
+                    import mujoco
+                    joint_pos = val.numpy()  # 6-dim joint positions (degrees)
+                    num_dof = len(joint_pos)
+
+                    # Convert to radians for MuJoCo
+                    joint_pos_rad = np.deg2rad(joint_pos)
+
+                    # Compute velocity (finite difference)
+                    # Reset on episode boundary
+                    is_new_episode = prev_episode_idx is not None and prev_episode_idx != current_episode_idx
+                    if prev_joint_pos is None or is_new_episode:
+                        joint_vel = np.zeros(num_dof)
+                    else:
+                        joint_vel = (joint_pos - prev_joint_pos) / dt
+                    prev_joint_pos = joint_pos.copy()
+
+                    # Compute FK using MuJoCo
+                    mj_data.qpos[:num_dof] = joint_pos_rad
+                    mujoco.mj_forward(mj_model, mj_data)
+                    ee_xyz = mj_data.site_xpos[ee_site_id].copy()
+                    xmat = mj_data.site_xmat[ee_site_id].reshape(3, 3)
+                    ee_euler = rotation_matrix_to_euler(xmat)
+
+                    # Concatenate into 18-dim full proprioceptive state
+                    full_state = np.concatenate([joint_pos, joint_vel, ee_xyz, ee_euler])
+                    val = torch.from_numpy(full_state).float()
+
                 current_state[key] = val.unsqueeze(0).to(storage_device)
 
             # Process previous sample now that we have current (for next_state)
