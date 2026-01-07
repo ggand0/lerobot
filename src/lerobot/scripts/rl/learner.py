@@ -1071,6 +1071,31 @@ def initialize_offline_replay_buffer(
             image_size = tuple(resize_size)
             logging.info(f"Resizing images to {image_size} during buffer conversion")
 
+    # Get full proprioception config
+    compute_full_proprioception = False
+    mujoco_model_path = None
+    ee_site_name = "gripper"
+    fps = 30.0
+
+    if hasattr(cfg, "env") and hasattr(cfg.env, "wrapper"):
+        compute_full_proprioception = getattr(cfg.env.wrapper, "add_full_proprioception", False)
+
+    if compute_full_proprioception:
+        # Get MuJoCo model path from robot config
+        if hasattr(cfg.env, "robot"):
+            robot_cfg = cfg.env.robot
+            # Try both direct access and nested config
+            mujoco_model_path = getattr(robot_cfg, "mujoco_model_path", None)
+            if mujoco_model_path is None and hasattr(robot_cfg, "config"):
+                mujoco_model_path = getattr(robot_cfg.config, "mujoco_model_path", None)
+            ee_site_name = getattr(robot_cfg, "end_effector_site", None)
+            if ee_site_name is None and hasattr(robot_cfg, "config"):
+                ee_site_name = getattr(robot_cfg.config, "end_effector_site", "gripper")
+            if ee_site_name is None:
+                ee_site_name = "gripper"
+        fps = getattr(cfg.env, "fps", 30.0)
+        logging.info(f"Computing full proprioception with MuJoCo FK (model: {mujoco_model_path}, site: {ee_site_name})")
+
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
         device=device,
@@ -1079,6 +1104,10 @@ def initialize_offline_replay_buffer(
         optimize_memory=True,
         capacity=cfg.policy.offline_buffer_capacity,
         image_size=image_size,
+        compute_full_proprioception=compute_full_proprioception,
+        mujoco_model_path=mujoco_model_path,
+        ee_site_name=ee_site_name,
+        fps=fps,
     )
 
     # Save to cache for future runs
