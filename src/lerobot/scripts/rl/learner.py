@@ -149,6 +149,13 @@ def train(cfg: TrainRLServerPipelineConfig, job_name: str | None = None):
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"learner_{job_name}.log")
 
+    # Save config to output dir for actor to use
+    config_save_path = os.path.join(cfg.output_dir, "train_config.json")
+    if not os.path.exists(config_save_path):
+        import json
+        with open(config_save_path, "w") as f:
+            json.dump(cfg.to_dict(), f, indent=4, default=str)
+
     # Initialize logging with explicit log file
     init_logging(log_file=log_file, display_pid=display_pid)
     logging.info(f"Learner logging initialized, writing to {log_file}")

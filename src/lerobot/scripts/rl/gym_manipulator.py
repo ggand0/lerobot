@@ -778,6 +778,43 @@ class ImageCropResizeWrapper(gym.Wrapper):
         return obs, info
 
 
+class ImageResizeWrapper(gym.Wrapper):
+    """Wrapper that resizes image observations without cropping."""
+
+    def __init__(self, env, resize_size):
+        super().__init__(env)
+        self.resize_size = tuple(resize_size)
+        # Update observation space for image keys
+        for key in list(self.observation_space.keys()):
+            if "image" in key:
+                new_shape = (3, self.resize_size[0], self.resize_size[1])
+                self.observation_space[key] = gym.spaces.Box(low=0, high=255, shape=new_shape)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        for k in list(obs.keys()):
+            if "image" in k:
+                device = obs[k].device
+                if device == torch.device("mps:0"):
+                    obs[k] = obs[k].cpu()
+                obs[k] = F.resize(obs[k], self.resize_size)
+                obs[k] = obs[k].clamp(0.0, 1.0)
+                obs[k] = obs[k].to(device)
+        return obs, reward, terminated, truncated, info
+
+    def reset(self, seed=None, options=None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        for k in list(obs.keys()):
+            if "image" in k:
+                device = obs[k].device
+                if device == torch.device("mps:0"):
+                    obs[k] = obs[k].cpu()
+                obs[k] = F.resize(obs[k], self.resize_size)
+                obs[k] = obs[k].clamp(0.0, 1.0)
+                obs[k] = obs[k].to(device)
+        return obs, info
+
+
 class ConvertToLeRobotObservation(gym.ObservationWrapper):
     """
     Wrapper that converts standard observations to LeRobot format.
@@ -2129,6 +2166,9 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
             crop_params_dict=cfg.wrapper.crop_params_dict,
             resize_size=cfg.wrapper.resize_size,
         )
+    elif cfg.wrapper and cfg.wrapper.resize_size is not None:
+        # Resize without cropping
+        env = ImageResizeWrapper(env=env, resize_size=cfg.wrapper.resize_size)
 
     # Add reward computation and control wrappers
     reward_classifier = init_reward_classifier(cfg)
