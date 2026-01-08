@@ -980,7 +980,11 @@ class ResetWrapper(gym.Wrapper):
             reset_pose: Fixed joint positions to reset to. If None, manual reset is used.
             reset_time_s: Time in seconds to wait after reset or allowed for manual reset.
             use_ik_reset: If True, use IK to compute reset joint positions from EE target.
-            ik_reset_ee_pos: Target EE position [x, y, z] for IK reset. Default: [0.20, 0.0, 0.06]
+            ik_reset_ee_pos: Target EE position [x, y, z] for IK reset.
+                Default: [0.25, -0.015, 0.05] matching rl_inference.py:
+                    - x=0.25 (cube_x)
+                    - y=-0.015 (cube_y + FINGER_WIDTH_OFFSET)
+                    - z=0.05 (CUBE_Z + GRASP_Z_OFFSET + HEIGHT_OFFSET = 0.015 + 0.005 + 0.03)
             reset_delay_s: Time in seconds to wait after reset (for repositioning objects).
         """
         super().__init__(env)
@@ -988,7 +992,8 @@ class ResetWrapper(gym.Wrapper):
         self.reset_pose = reset_pose
         self.robot = self.unwrapped.robot
         self.use_ik_reset = use_ik_reset
-        self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.20, 0.0, 0.06])
+        # Default target matches rl_inference.py initial position (5cm above cube)
+        self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.25, -0.015, 0.05])
         self.reset_delay_s = reset_delay_s
         self._ik_reset_pose = None  # Cached IK-computed reset pose
 
