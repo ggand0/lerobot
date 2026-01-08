@@ -73,6 +73,84 @@ from lerobot.utils.utils import log_say
 logging.basicConfig(level=logging.INFO)
 
 
+# =============================================================================
+# Calibration-aware coordinate conversion for IK reset
+# =============================================================================
+import json
+from pathlib import Path
+
+# Load calibration for SO101 follower
+_IK_CALIBRATION_PATH = Path("/home/gota/.cache/huggingface/lerobot/calibration/robots/so101_follower/ggando_so101_follower.json")
+_IK_CALIBRATION = None
+_IK_ENCODER_PER_RAD = 4096 / (2 * np.pi)  # ~652 encoder units per radian
+_IK_MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+
+
+def _load_ik_calibration():
+    """Load calibration data for IK coordinate conversion."""
+    global _IK_CALIBRATION
+    if _IK_CALIBRATION is None:
+        if _IK_CALIBRATION_PATH.exists():
+            with open(_IK_CALIBRATION_PATH) as f:
+                _IK_CALIBRATION = json.load(f)
+        else:
+            logging.warning(f"IK calibration file not found at {_IK_CALIBRATION_PATH}")
+            _IK_CALIBRATION = {}
+    return _IK_CALIBRATION
+
+
+def _ik_normalized_to_radians(normalized: float, joint_name: str) -> float:
+    """Convert LeRobot normalized (-100 to 100) to radians for IK.
+
+    This uses calibration data to properly convert between coordinate systems.
+    The conversion accounts for motor encoder ranges and calibration offsets.
+    """
+    cal = _load_ik_calibration().get(joint_name)
+    if cal is None:
+        # Fallback: assume normalized IS degrees (legacy behavior)
+        logging.warning(f"No calibration for {joint_name}, using deg2rad fallback")
+        return np.deg2rad(normalized)
+
+    range_min = cal["range_min"]
+    range_max = cal["range_max"]
+
+    # Normalized (-100 to 100) to encoder position
+    encoder = (normalized + 100) / 200 * (range_max - range_min) + range_min
+
+    # Encoder to radians (mid-range = 0 radians)
+    mid_encoder = (range_min + range_max) / 2
+    radians = (encoder - mid_encoder) / _IK_ENCODER_PER_RAD
+
+    return radians
+
+
+def _ik_radians_to_normalized(radians: float, joint_name: str) -> float:
+    """Convert radians to LeRobot normalized (-100 to 100) for IK.
+
+    This uses calibration data to properly convert between coordinate systems.
+    """
+    cal = _load_ik_calibration().get(joint_name)
+    if cal is None:
+        # Fallback: assume output should be degrees (legacy behavior)
+        logging.warning(f"No calibration for {joint_name}, using rad2deg fallback")
+        return np.rad2deg(radians)
+
+    range_min = cal["range_min"]
+    range_max = cal["range_max"]
+
+    # Radians to encoder (mid-range = 0 radians)
+    mid_encoder = (range_min + range_max) / 2
+    encoder = radians * _IK_ENCODER_PER_RAD + mid_encoder
+
+    # Clamp to valid range
+    encoder = np.clip(encoder, range_min, range_max)
+
+    # Encoder to normalized (-100 to 100)
+    normalized = (encoder - range_min) / (range_max - range_min) * 200 - 100
+
+    return normalized
+
+
 def reset_follower_position(robot_arm, target_position):
     current_position_dict = robot_arm.bus.sync_read("Present_Position")
     current_position = np.array(
@@ -898,7 +976,7 @@ class ResetWrapper(gym.Wrapper):
         self.reset_pose = reset_pose
         self.robot = self.unwrapped.robot
         self.use_ik_reset = use_ik_reset
-        self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.25, 0.0, 0.15])
+        self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.20, 0.0, 0.06])
         self._ik_reset_pose = None  # Cached IK-computed reset pose
 
     def reset(self, *, seed=None, options=None):
@@ -920,51 +998,94 @@ class ResetWrapper(gym.Wrapper):
         # Determine reset pose: use IK if enabled, otherwise use fixed pose
         reset_pose = self.reset_pose
         if self.use_ik_reset and hasattr(self.robot, '_compute_ik'):
-            # Use iterative IK to move to target EE position
-            # This keeps joint angles in valid motor range (unlike single-shot IK)
+            # ================================================================
+            # TWO-STEP IK RESET (matching rl_inference.py pattern)
+            # Step 1: Move to fixed reset pose first (known good configuration)
+            # Step 2: Apply IK to fine-tune to target EE position
+            # ================================================================
             logging.info(f"IK reset to EE target: {self.ik_reset_ee_pos}")
 
-            # Get motor names
-            current_pos_dict = self.robot.bus.sync_read("Present_Position")
-            motor_names = list(current_pos_dict.keys())
+            # Get actual motor names from robot
+            initial_pos_dict = self.robot.bus.sync_read("Present_Position")
+            robot_motor_names = [k for k in initial_pos_dict.keys() if k != "gripper"][:5]
 
-            # Do iterative IK steps (like send_action does)
-            for step in range(100):  # Max 100 steps
-                # Read current position
+            # ============================================================
+            # STEP 1: Move to fixed reset pose first (like rl_inference.py)
+            # This gets the robot to a known good configuration before IK
+            # ============================================================
+            if self.reset_pose is not None:
+                logging.info(f"IK reset step 1: Moving to fixed reset pose")
+                reset_follower_position(self.unwrapped.robot, self.reset_pose)
+                busy_wait(0.3)  # Let robot settle
+
+            # ============================================================
+            # STEP 2: Apply IK from the good starting pose
+            # ============================================================
+            ik_converged = False
+            prev_error = float('inf')
+            stuck_count = 0
+
+            for ik_step in range(50):  # Fewer iterations needed from good start
+                # 1. Read ACTUAL robot position with CORRECT calibration conversion
                 current_pos_dict = self.robot.bus.sync_read("Present_Position")
-                current_joints_deg = np.array([current_pos_dict[name] for name in motor_names])[:5]
-                current_joints_rad = np.deg2rad(current_joints_deg)
+                current_normalized = np.array([current_pos_dict[name] for name in robot_motor_names])
+                current_rad = np.array([
+                    _ik_normalized_to_radians(current_normalized[i], _IK_MOTOR_NAMES[i])
+                    for i in range(5)
+                ])
 
-                # Get current EE position
-                self.robot._sync_mujoco(current_joints_rad)
+                # 2. Sync MuJoCo to actual position and check error
+                self.robot._sync_mujoco(current_rad)
                 current_ee = self.robot._get_ee_position()
-
-                # Check if close enough
                 error = np.linalg.norm(self.ik_reset_ee_pos - current_ee)
-                if error < 0.01:  # 1cm tolerance
-                    logging.info(f"IK reset reached target in {step} steps (error: {error:.4f}m)")
+
+                if ik_step == 0:
+                    logging.info(f"IK reset step 2: EE={current_ee}, error={error:.4f}m")
+
+                # Converged within 1.5cm
+                if error < 0.015:
+                    logging.info(f"IK reset converged at step {ik_step}, error={error:.4f}m")
+                    ik_converged = True
                     break
 
-                # Compute incremental IK step
-                target_joints_rad = self.robot._compute_ik(self.ik_reset_ee_pos, current_joints_rad)
-                target_joints_deg = np.rad2deg(target_joints_rad)
+                # Detect if stuck (error not improving)
+                if abs(error - prev_error) < 0.0005:
+                    stuck_count += 1
+                    if stuck_count >= 3:
+                        logging.info(f"IK reset done (converged), step {ik_step}, error={error:.4f}m")
+                        ik_converged = error < 0.025  # Accept if within 2.5cm
+                        break
+                else:
+                    stuck_count = 0
+                prev_error = error
 
-                # Build action dict and send
-                action_dict = {motor_names[i]: target_joints_deg[i] for i in range(5)}
-                # Keep gripper at current position
-                if len(motor_names) > 5:
-                    action_dict[motor_names[5]] = current_pos_dict[motor_names[5]]
+                # 3. Compute IK from ACTUAL current position
+                target_rad = self.robot._compute_ik(self.ik_reset_ee_pos, current_rad)
 
+                # 4. Convert back to normalized with CORRECT calibration conversion
+                target_normalized = np.array([
+                    _ik_radians_to_normalized(target_rad[i], _IK_MOTOR_NAMES[i])
+                    for i in range(5)
+                ])
+
+                # Debug: log progress
+                if ik_step < 3 or ik_step % 10 == 0:
+                    logging.info(f"IK step {ik_step}: error={error:.4f}m, EE={current_ee}")
+
+                # 5. Send to robot
+                gripper_normalized = current_pos_dict.get("gripper", 50.0)
+                action_dict = {name: target_normalized[i] for i, name in enumerate(robot_motor_names)}
+                action_dict["gripper"] = gripper_normalized
                 self.robot.bus.sync_write("Goal_Position", action_dict)
-                busy_wait(0.02)  # 50Hz
 
-            # Also reset leader if present
-            if hasattr(self.env, "robot_leader"):
-                current_pos_dict = self.robot.bus.sync_read("Present_Position")
-                self.env.robot_leader.bus.sync_write("Torque_Enable", 1)
-                reset_follower_position(self.env.robot_leader, np.array([current_pos_dict[n] for n in motor_names]))
+                # 6. Wait for robot to move
+                busy_wait(0.05)
 
-            reset_pose = None  # Already moved via IK
+            if not ik_converged:
+                logging.warning(f"IK reset did not fully converge, final error={error:.4f}m")
+
+            # IK reset already moved the robot, skip reset_follower_position below
+            reset_pose = None
 
         if reset_pose is not None:
             log_say("Reset the environment.", play_sounds=False)
@@ -1526,7 +1647,11 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         """
         import cv2
 
-        key = cv2.waitKey(1) & 0xFF
+        try:
+            key = cv2.waitKey(1) & 0xFF
+        except cv2.error:
+            # OpenCV built without GTK support - skip keyboard polling
+            return
 
         if key == 255:  # No key pressed
             return
@@ -2318,7 +2443,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
 
     env = ResetWrapper(
         env=env,
-        reset_pose=cfg.wrapper.fixed_reset_joint_positions if not use_ik_reset else None,
+        reset_pose=cfg.wrapper.fixed_reset_joint_positions,
         reset_time_s=cfg.wrapper.reset_time_s,
         use_ik_reset=use_ik_reset,
         ik_reset_ee_pos=ik_reset_ee_pos,
