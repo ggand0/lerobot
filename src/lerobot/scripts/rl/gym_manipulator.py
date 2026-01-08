@@ -1453,32 +1453,41 @@ class BaseLeaderControlWrapper(gym.Wrapper):
 
     def _init_keyboard_listener(self):
         """
-        Initialize the keyboard listener for intervention control.
+        Initialize keyboard handling via cv2.waitKey (window-focused only).
 
-        This method sets up keyboard event handling if not in headless mode.
+        Unlike pynput which captures global keyboard events, cv2.waitKey only
+        detects keys when an OpenCV window is focused.
         """
-        import time
-        from pynput import keyboard as keyboard_device
+        self.listener = None  # No pynput listener - use cv2 instead
 
-        self._last_key_press_time = {}
-        self._key_debounce_seconds = 0.3  # 300ms debounce
+    def _poll_cv2_keys(self):
+        """
+        Poll for keyboard input via cv2.waitKey.
 
-        def on_press(key):
-            current_time = time.time()
-            key_str = str(key)
+        This only detects keys when the OpenCV camera window is focused.
+        Should be called after cv2.imshow/render.
+        """
+        import cv2
 
-            # Debounce: ignore if same key pressed within debounce period
-            if key_str in self._last_key_press_time:
-                if current_time - self._last_key_press_time[key_str] < self._key_debounce_seconds:
-                    return
+        key = cv2.waitKey(1) & 0xFF
 
-            self._last_key_press_time[key_str] = current_time
+        if key == 255:  # No key pressed
+            return
 
-            with self.event_lock:
-                self._handle_key_press(key, keyboard_device)
+        with self.event_lock:
+            if key == 27:  # ESC
+                self.keyboard_events["episode_end"] = True
+            elif key == ord('s'):
+                logging.info("Key 's' pressed. Episode success triggered.")
+                self.keyboard_events["episode_success"] = True
+            elif key == 81:  # Left arrow
+                self.keyboard_events["rerecord_episode"] = True
+            elif key == ord(' '):  # Space
+                self._handle_space_key()
 
-        self.listener = keyboard_device.Listener(on_press=on_press)
-        self.listener.start()
+    def _handle_space_key(self):
+        """Handle space key press. Override in subclasses for specific behavior."""
+        pass
 
     def _check_intervention(self):
         """
@@ -1598,6 +1607,9 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         # NOTE:
         obs, reward, terminated, truncated, info = self.env.step(action)
 
+        # Poll keyboard via cv2 (only works when camera window is focused)
+        self._poll_cv2_keys()
+
         if isinstance(action, np.ndarray):
             action = torch.from_numpy(action)
 
@@ -1681,18 +1693,20 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         Extends the base handler to respond to space key for toggling intervention.
         """
         super()._handle_key_press(key, keyboard_device)
-        if key == keyboard_device.Key.space:
-            if not self.keyboard_events["human_intervention_step"]:
-                logging.info(
-                    "Space key pressed. Human intervention required.\n"
-                    "Place the leader in similar pose to the follower and press space again."
-                )
-                self.keyboard_events["human_intervention_step"] = True
-                log_say("Human intervention step.", play_sounds=False)
-            else:
-                self.keyboard_events["human_intervention_step"] = False
-                logging.info("Space key pressed for a second time.\nContinuing with policy actions.")
-                log_say("Continuing with policy actions.", play_sounds=False)
+
+    def _handle_space_key(self):
+        """Toggle human intervention mode on space key press."""
+        if not self.keyboard_events["human_intervention_step"]:
+            logging.info(
+                "Space key pressed. Human intervention required.\n"
+                "Place the leader in similar pose to the follower and press space again."
+            )
+            self.keyboard_events["human_intervention_step"] = True
+            log_say("Human intervention step.", play_sounds=False)
+        else:
+            self.keyboard_events["human_intervention_step"] = False
+            logging.info("Space key pressed for a second time.\nContinuing with policy actions.")
+            log_say("Continuing with policy actions.", play_sounds=False)
 
     def _check_intervention(self):
         """
@@ -1701,9 +1715,7 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         Returns:
             Boolean indicating whether intervention mode is active.
         """
-        # For demonstration recording (no policy), always enable intervention
-        # This keeps the leader arm's torque disabled so it can be freely moved
-        return True  # Always in intervention mode for SO-101 demonstration recording
+        return self.keyboard_events["human_intervention_step"]
 
 
 class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
