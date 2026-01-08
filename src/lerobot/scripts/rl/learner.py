@@ -1107,7 +1107,14 @@ def initialize_offline_replay_buffer(
     # Get policy action dim
     policy_action_dim = None
     if hasattr(cfg.policy, "output_features") and "action" in cfg.policy.output_features:
-        policy_action_shape = cfg.policy.output_features["action"].get("shape", None)
+        action_feature = cfg.policy.output_features["action"]
+        # Handle both dict and PolicyFeature object
+        if hasattr(action_feature, "shape"):
+            policy_action_shape = action_feature.shape
+        elif isinstance(action_feature, dict):
+            policy_action_shape = action_feature.get("shape", None)
+        else:
+            policy_action_shape = None
         if policy_action_shape:
             policy_action_dim = policy_action_shape[0] if isinstance(policy_action_shape, (list, tuple)) else policy_action_shape
 

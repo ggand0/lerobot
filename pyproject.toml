@@ -88,6 +88,7 @@ dependencies = [
     "transformers>=4.51.3",
     "grpcio>=1.73.1",
     "grpcio-tools>=1.73.1",
+    "mujoco>=3.0.0",
 ]
 
 # Optional dependencies
@@ -134,7 +135,7 @@ video_benchmark = ["scikit-image>=0.23.2", "pandas>=2.2.2"]
 # Simulation
 aloha = ["gym-aloha>=0.1.1"]
 pusht = ["gym-pusht>=0.1.5", "pymunk>=6.6.0,<7.0.0"] # TODO: Fix pymunk version in gym-pusht instead
-xarm = ["gym-xarm>=0.1.1"]
+# xarm = ["gym-xarm>=0.1.1"]  # Disabled: requires mujoco<3.0 which conflicts with SO-101 models
 
 # All
 all = [
@@ -152,8 +153,7 @@ all = [
     "lerobot[test]",
     "lerobot[video_benchmark]",
     "lerobot[aloha]",
-    "lerobot[pusht]",
-    "lerobot[xarm]"
+    "lerobot[pusht]"
 ]
 
 [project.scripts]

@@ -701,7 +701,21 @@ class ReplayBuffer:
             else:
                 reward = 0.0
 
-            action = prev_sample["action"].unsqueeze(0).to(storage_device)
+            action = prev_sample["action"]
+
+            # Convert joint actions to EE delta actions for the last frame
+            # Since there's no next sample, use zero EE delta
+            if convert_actions_to_ee and mj_model is not None:
+                # Gripper action: use gripper value from action
+                gripper_val = action[-1].item()
+                gripper_normalized = (gripper_val / 50.0) - 1.0  # 0->-1, 100->1
+                gripper_normalized = np.clip(gripper_normalized, -1.0, 1.0)
+
+                # Zero EE delta for last frame (no movement)
+                ee_action = np.array([0.0, 0.0, 0.0, gripper_normalized], dtype=np.float32)
+                action = torch.from_numpy(ee_action)
+
+            action = action.unsqueeze(0).to(storage_device)
 
             complementary_info = None
             if has_complementary_info:
