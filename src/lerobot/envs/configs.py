@@ -185,6 +185,8 @@ class EnvTransformConfig:
     control_time_s: float = 20.0
     fixed_reset_joint_positions: Any | None = None
     reset_time_s: float = 5.0
+    reset_delay_s: float = 0.0  # Delay after reset for repositioning objects
+    ik_reset_ee_pos: list[float] | None = None  # Target EE position [x, y, z] for IK reset
     use_gripper: bool = True
     gripper_quantization_threshold: float | None = 0.8
     gripper_penalty: float = 0.0
