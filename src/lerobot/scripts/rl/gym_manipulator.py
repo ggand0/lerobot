@@ -880,6 +880,8 @@ class ResetWrapper(gym.Wrapper):
         env: RobotEnv,
         reset_pose: np.ndarray | None = None,
         reset_time_s: float = 5,
+        use_ik_reset: bool = False,
+        ik_reset_ee_pos: list | None = None,
     ):
         """
         Initialize the reset wrapper.
@@ -888,11 +890,16 @@ class ResetWrapper(gym.Wrapper):
             env: The environment to wrap.
             reset_pose: Fixed joint positions to reset to. If None, manual reset is used.
             reset_time_s: Time in seconds to wait after reset or allowed for manual reset.
+            use_ik_reset: If True, use IK to compute reset joint positions from EE target.
+            ik_reset_ee_pos: Target EE position [x, y, z] for IK reset. Default: [0.25, 0.0, 0.15]
         """
         super().__init__(env)
         self.reset_time_s = reset_time_s
         self.reset_pose = reset_pose
         self.robot = self.unwrapped.robot
+        self.use_ik_reset = use_ik_reset
+        self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.25, 0.0, 0.15])
+        self._ik_reset_pose = None  # Cached IK-computed reset pose
 
     def reset(self, *, seed=None, options=None):
         """
@@ -909,15 +916,35 @@ class ResetWrapper(gym.Wrapper):
             The initial observation and info from the wrapped environment.
         """
         start_time = time.perf_counter()
-        if self.reset_pose is not None:
+
+        # Determine reset pose: use IK if enabled, otherwise use fixed pose
+        reset_pose = self.reset_pose
+        if self.use_ik_reset and hasattr(self.robot, '_compute_ik'):
+            if self._ik_reset_pose is None:
+                # Compute IK reset pose once and cache it
+                import mujoco
+                # Get current joint positions as starting point
+                current_pos_dict = self.robot.bus.sync_read("Present_Position")
+                current_joints_deg = np.array([current_pos_dict[name] for name in current_pos_dict])[:6]
+                current_joints_rad = np.deg2rad(current_joints_deg)
+
+                # Sync MuJoCo and compute IK
+                self.robot._sync_mujoco(current_joints_rad)
+                target_joints_rad = self.robot._compute_ik(self.ik_reset_ee_pos, current_joints_rad)
+                self._ik_reset_pose = np.rad2deg(target_joints_rad)
+                logging.info(f"Computed IK reset pose for EE target {self.ik_reset_ee_pos}: {self._ik_reset_pose}")
+
+            reset_pose = self._ik_reset_pose
+
+        if reset_pose is not None:
             log_say("Reset the environment.", play_sounds=False)
-            reset_follower_position(self.unwrapped.robot, self.reset_pose)
+            reset_follower_position(self.unwrapped.robot, reset_pose)
             log_say("Reset the environment done.", play_sounds=False)
 
             if hasattr(self.env, "robot_leader"):
                 self.env.robot_leader.bus.sync_write("Torque_Enable", 1)
                 log_say("Reset the leader robot.", play_sounds=False)
-                reset_follower_position(self.env.robot_leader, self.reset_pose)
+                reset_follower_position(self.env.robot_leader, reset_pose)
                 log_say("Reset the leader robot done.", play_sounds=False)
         else:
             log_say(
@@ -2255,10 +2282,16 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     else:
         raise ValueError(f"Invalid control mode: {control_mode}")
 
+    # Use IK reset if robot has MuJoCo model (SO101FollowerEndEffector)
+    use_ik_reset = hasattr(cfg.robot, 'mujoco_model_path') and cfg.robot.mujoco_model_path is not None
+    ik_reset_ee_pos = getattr(cfg.wrapper, 'ik_reset_ee_pos', None)
+
     env = ResetWrapper(
         env=env,
-        reset_pose=cfg.wrapper.fixed_reset_joint_positions,
+        reset_pose=cfg.wrapper.fixed_reset_joint_positions if not use_ik_reset else None,
         reset_time_s=cfg.wrapper.reset_time_s,
+        use_ik_reset=use_ik_reset,
+        ik_reset_ee_pos=ik_reset_ee_pos,
     )
 
     env = BatchCompatibleWrapper(env=env)
