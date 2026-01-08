@@ -63,7 +63,7 @@ from lerobot.configs.train import TrainRLServerPipelineConfig
 from lerobot.policies.factory import make_policy
 from lerobot.policies.sac.modeling_sac import SACPolicy
 from lerobot.robots import so100_follower, so101_follower  # noqa: F401
-from lerobot.scripts.rl.gym_manipulator import make_robot_env
+from lerobot.scripts.rl.gym_manipulator import make_robot_env, _clamp_degrees
 from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
 from lerobot.transport import services_pb2, services_pb2_grpc
 from lerobot.transport.utils import (
@@ -89,7 +89,14 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
+import numpy as np
+
 ACTOR_SHUTDOWN_TIMEOUT = 30
+
+# Safe joint positions (all zeros radians = extended forward)
+SAFE_JOINTS_RAD = np.zeros(5)
+# Rest joint positions (radians) - matches rl_inference.py REST_JOINTS
+REST_JOINTS_RAD = np.array([-0.2424, -1.8040, 1.6582, 0.7309, -0.0629])
 
 
 #################################################
@@ -206,6 +213,98 @@ def actor_cli(cfg: TrainRLServerPipelineConfig):
 #################################################
 
 
+def safe_return_to_home(online_env):
+    """
+    Safe return sequence: lift up first, then go to rest position.
+    Matches rl_inference.py safe_return() behavior.
+    """
+    logging.info("[ACTOR] Safe return sequence...")
+
+    try:
+        # Get the robot from the environment
+        robot = online_env.unwrapped.robot
+
+        # Check if robot has IK capabilities (SO101FollowerEndEffector)
+        if not hasattr(robot, '_compute_ik') or not hasattr(robot, '_sync_mujoco'):
+            logging.info("[ACTOR] Robot doesn't support IK, skipping safe return")
+            return
+
+        bus = robot.bus
+        motor_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+
+        # Step 1: Lift up to safe height (keep wrist orientation)
+        logging.info("[ACTOR] Step 1: Lifting to safe height...")
+        try:
+            # Read current position
+            pos_dict = bus.sync_read("Present_Position")
+            current_deg = np.array([pos_dict[name] for name in motor_names])
+            current_rad = np.deg2rad(current_deg)
+
+            # Sync MuJoCo and get current EE
+            robot._sync_mujoco(current_rad)
+            current_ee = robot._get_ee_position()
+
+            # Target: lift to 15cm height
+            safe_height_target = current_ee.copy()
+            safe_height_target[2] = 0.15
+
+            for step in range(40):
+                # Read current position
+                pos_dict = bus.sync_read("Present_Position")
+                current_deg = np.array([pos_dict[name] for name in motor_names])
+                current_rad = np.deg2rad(current_deg)
+
+                # Lock wrist orientation at top-down
+                current_rad[3] = np.pi / 2   # wrist_flex
+                current_rad[4] = -np.pi / 2  # wrist_roll
+
+                # Compute IK with locked wrist
+                target_rad = robot._compute_ik(safe_height_target, current_rad)
+                target_rad[3] = np.pi / 2
+                target_rad[4] = -np.pi / 2
+
+                # Convert to degrees
+                target_deg = np.rad2deg(target_rad)
+
+                # Clamp delta to max 10° per step
+                delta_deg = np.clip(target_deg - current_deg, -10, 10)
+                target_deg = current_deg + delta_deg
+
+                # Clamp to valid encoder range
+                target_deg = _clamp_degrees(target_deg)
+
+                # Send command
+                action_dict = {name: target_deg[i] for i, name in enumerate(motor_names)}
+                action_dict["gripper"] = pos_dict.get("gripper", 50.0)
+                bus.sync_write("Goal_Position", action_dict)
+                busy_wait(0.05)
+
+                # Check if high enough
+                robot._sync_mujoco(np.deg2rad(target_deg))
+                ee_pos = robot._get_ee_position()
+                if ee_pos[2] > 0.12:
+                    break
+
+            logging.info(f"[ACTOR] Lifted to: {robot._get_ee_position()}")
+            busy_wait(0.3)
+        except Exception as e:
+            logging.warning(f"[ACTOR] Failed to lift ({e}), going directly to rest...")
+
+        # Step 2: Return to rest position
+        logging.info("[ACTOR] Step 2: Returning to rest position...")
+        rest_deg = np.rad2deg(REST_JOINTS_RAD)
+        rest_deg = _clamp_degrees(rest_deg)  # Clamp to valid encoder range
+        action_dict = {name: rest_deg[i] for i, name in enumerate(motor_names)}
+        action_dict["gripper"] = -50.0  # Close gripper at rest
+        bus.sync_write("Goal_Position", action_dict)
+        busy_wait(1.0)
+
+        logging.info("[ACTOR] Safe return complete")
+
+    except Exception as e:
+        logging.error(f"[ACTOR] Safe return failed: {e}")
+
+
 def act_with_policy(
     cfg: TrainRLServerPipelineConfig,
     shutdown_event: any,  # Event,
@@ -268,95 +367,101 @@ def act_with_policy(
 
     policy_timer = TimerManager("Policy inference", log=False)
 
-    for interaction_step in range(cfg.policy.online_steps):
-        start_time = time.perf_counter()
-        if shutdown_event.is_set():
-            logging.info("[ACTOR] Shutting down act_with_policy")
-            return
+    try:
+        for interaction_step in range(cfg.policy.online_steps):
+            start_time = time.perf_counter()
+            if shutdown_event.is_set():
+                logging.info("[ACTOR] Shutting down act_with_policy")
+                break
 
-        if interaction_step >= cfg.policy.online_step_before_learning:
-            # Time policy inference and check if it meets FPS requirement
-            with policy_timer:
-                action = policy.select_action(batch=obs)
-            policy_fps = policy_timer.fps_last
+            if interaction_step >= cfg.policy.online_step_before_learning:
+                # Time policy inference and check if it meets FPS requirement
+                with policy_timer:
+                    action = policy.select_action(batch=obs)
+                policy_fps = policy_timer.fps_last
 
-            log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
+                log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
 
-        else:
-            action = online_env.action_space.sample()
+            else:
+                action = online_env.action_space.sample()
 
-        next_obs, reward, done, truncated, info = online_env.step(action)
+            next_obs, reward, done, truncated, info = online_env.step(action)
 
-        sum_reward_episode += float(reward)
-        # Increment total steps counter for intervention rate
-        episode_total_steps += 1
+            sum_reward_episode += float(reward)
+            # Increment total steps counter for intervention rate
+            episode_total_steps += 1
 
-        # NOTE: We override the action if the intervention is True, because the action applied is the intervention action
-        if "is_intervention" in info and info["is_intervention"]:
-            # NOTE: The action space for demonstration before hand is with the full action space
-            # but sometimes for example we want to deactivate the gripper
-            action = info["action_intervention"]
-            episode_intervention = True
-            # Increment intervention steps counter
-            episode_intervention_steps += 1
+            # NOTE: We override the action if the intervention is True, because the action applied is the intervention action
+            if "is_intervention" in info and info["is_intervention"]:
+                # NOTE: The action space for demonstration before hand is with the full action space
+                # but sometimes for example we want to deactivate the gripper
+                action = info["action_intervention"]
+                episode_intervention = True
+                # Increment intervention steps counter
+                episode_intervention_steps += 1
 
-        list_transition_to_send_to_learner.append(
-            Transition(
-                state=obs,
-                action=action,
-                reward=reward,
-                next_state=next_obs,
-                done=done,
-                truncated=truncated,  # TODO: (azouitine) Handle truncation properly
-                complementary_info=info,
-            )
-        )
-        # assign obs to the next obs and continue the rollout
-        obs = next_obs
-
-        if done or truncated:
-            logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
-
-            update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
-
-            if len(list_transition_to_send_to_learner) > 0:
-                push_transitions_to_transport_queue(
-                    transitions=list_transition_to_send_to_learner,
-                    transitions_queue=transitions_queue,
-                )
-                list_transition_to_send_to_learner = []
-
-            stats = get_frequency_stats(policy_timer)
-            policy_timer.reset()
-
-            # Calculate intervention rate
-            intervention_rate = 0.0
-            if episode_total_steps > 0:
-                intervention_rate = episode_intervention_steps / episode_total_steps
-
-            # Send episodic reward to the learner
-            interactions_queue.put(
-                python_object_to_bytes(
-                    {
-                        "Episodic reward": sum_reward_episode,
-                        "Interaction step": interaction_step,
-                        "Episode intervention": int(episode_intervention),
-                        "Intervention rate": intervention_rate,
-                        **stats,
-                    }
+            list_transition_to_send_to_learner.append(
+                Transition(
+                    state=obs,
+                    action=action,
+                    reward=reward,
+                    next_state=next_obs,
+                    done=done,
+                    truncated=truncated,  # TODO: (azouitine) Handle truncation properly
+                    complementary_info=info,
                 )
             )
+            # assign obs to the next obs and continue the rollout
+            obs = next_obs
 
-            # Reset intervention counters
-            sum_reward_episode = 0.0
-            episode_intervention = False
-            episode_intervention_steps = 0
-            episode_total_steps = 0
-            obs, info = online_env.reset()
+            if done or truncated:
+                logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
 
-        if cfg.env.fps is not None:
-            dt_time = time.perf_counter() - start_time
-            busy_wait(1 / cfg.env.fps - dt_time)
+                update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
+
+                if len(list_transition_to_send_to_learner) > 0:
+                    push_transitions_to_transport_queue(
+                        transitions=list_transition_to_send_to_learner,
+                        transitions_queue=transitions_queue,
+                    )
+                    list_transition_to_send_to_learner = []
+
+                stats = get_frequency_stats(policy_timer)
+                policy_timer.reset()
+
+                # Calculate intervention rate
+                intervention_rate = 0.0
+                if episode_total_steps > 0:
+                    intervention_rate = episode_intervention_steps / episode_total_steps
+
+                # Send episodic reward to the learner
+                interactions_queue.put(
+                    python_object_to_bytes(
+                        {
+                            "Episodic reward": sum_reward_episode,
+                            "Interaction step": interaction_step,
+                            "Episode intervention": int(episode_intervention),
+                            "Intervention rate": intervention_rate,
+                            **stats,
+                        }
+                    )
+                )
+
+                # Reset intervention counters
+                sum_reward_episode = 0.0
+                episode_intervention = False
+                episode_intervention_steps = 0
+                episode_total_steps = 0
+                obs, info = online_env.reset()
+
+            if cfg.env.fps is not None:
+                dt_time = time.perf_counter() - start_time
+                busy_wait(1 / cfg.env.fps - dt_time)
+
+    finally:
+        # Safe return to home position on shutdown (ctrl+c, etc.)
+        logging.info("[ACTOR] Cleaning up - returning robot to safe position")
+        safe_return_to_home(online_env)
 
 
 #################################################
