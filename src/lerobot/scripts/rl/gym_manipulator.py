@@ -452,21 +452,29 @@ class RobotEnv(gym.Env):
         # 1.0 action corresponds to no-op action
         action_dict["gripper"] = action[3] if self.use_gripper else 1.0
 
-        # Check if this is a joint space robot without URDF support
-        if not hasattr(self.robot.config, 'urdf_path'):
-            # Check if we have leader positions from GearedLeaderControlWrapper
-            leader_positions = getattr(self, '_leader_positions', None)
-            if leader_positions:
-                # Use leader positions for direct joint mirroring
-                joint_action = {f"{name}.pos": pos for name, pos in leader_positions.items()}
-                self.robot.send_action(joint_action)
+        # Check for leader positions from intervention (joint mirroring takes priority)
+        leader_positions = getattr(self, '_leader_positions', None)
+        if leader_positions:
+            # Intervention mode: mirror leader joint positions directly
+            joint_action = {f"{name}.pos": pos for name, pos in leader_positions.items()}
+            self.robot.send_action(joint_action)
+            self._leader_positions = None  # Clear after use
+        else:
+            # Check if robot supports end-effector control (has MuJoCo model or URDF)
+            has_ee_control = (
+                hasattr(self.robot.config, 'mujoco_model_path') and self.robot.config.mujoco_model_path
+            ) or (
+                hasattr(self.robot.config, 'urdf_path') and self.robot.config.urdf_path
+            )
+
+            if has_ee_control:
+                # End-effector control via IK
+                self.robot.send_action(action_dict)
             else:
-                # Fallback: send current positions (no movement)
+                # No EE control and no leader - send current positions (no movement)
                 current_obs = self.robot.get_observation()
                 joint_action = {key: current_obs[key] for key in current_obs if key.endswith('.pos')}
                 self.robot.send_action(joint_action)
-        else:
-            self.robot.send_action(action_dict)
 
         self._get_observation()
 
@@ -962,6 +970,7 @@ class ResetWrapper(gym.Wrapper):
         reset_time_s: float = 5,
         use_ik_reset: bool = False,
         ik_reset_ee_pos: list | None = None,
+        reset_delay_s: float = 0.0,
     ):
         """
         Initialize the reset wrapper.
@@ -971,7 +980,8 @@ class ResetWrapper(gym.Wrapper):
             reset_pose: Fixed joint positions to reset to. If None, manual reset is used.
             reset_time_s: Time in seconds to wait after reset or allowed for manual reset.
             use_ik_reset: If True, use IK to compute reset joint positions from EE target.
-            ik_reset_ee_pos: Target EE position [x, y, z] for IK reset. Default: [0.25, 0.0, 0.15]
+            ik_reset_ee_pos: Target EE position [x, y, z] for IK reset. Default: [0.20, 0.0, 0.06]
+            reset_delay_s: Time in seconds to wait after reset (for repositioning objects).
         """
         super().__init__(env)
         self.reset_time_s = reset_time_s
@@ -979,6 +989,7 @@ class ResetWrapper(gym.Wrapper):
         self.robot = self.unwrapped.robot
         self.use_ik_reset = use_ik_reset
         self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.20, 0.0, 0.06])
+        self.reset_delay_s = reset_delay_s
         self._ik_reset_pose = None  # Cached IK-computed reset pose
 
     def reset(self, *, seed=None, options=None):
@@ -1124,8 +1135,14 @@ class ResetWrapper(gym.Wrapper):
             if not ik_converged:
                 logging.warning(f"IK reset did not fully converge, final error={error:.4f}m")
 
-            # IK reset complete, return immediately
+            # IK reset complete
             logging.info("IK reset complete")
+
+            # Wait for user to reposition objects if delay configured
+            if self.reset_delay_s > 0:
+                logging.info(f"Waiting {self.reset_delay_s}s for object repositioning...")
+                time.sleep(self.reset_delay_s)
+
             return super().reset(seed=seed, options=options)
 
         if reset_pose is not None:
@@ -1672,12 +1689,38 @@ class BaseLeaderControlWrapper(gym.Wrapper):
 
     def _init_keyboard_listener(self):
         """
-        Initialize keyboard handling via cv2.waitKey (window-focused only).
+        Initialize keyboard handling via pynput for global keyboard capture.
 
-        Unlike pynput which captures global keyboard events, cv2.waitKey only
-        detects keys when an OpenCV window is focused.
+        This allows key detection even when terminal is focused (not just OpenCV window).
         """
-        self.listener = None  # No pynput listener - use cv2 instead
+        try:
+            from pynput import keyboard
+
+            def on_press(key):
+                try:
+                    with self.event_lock:
+                        if key == keyboard.Key.esc:
+                            logging.info("ESC pressed. Ending episode.")
+                            self.keyboard_events["episode_end"] = True
+                        elif hasattr(key, 'char') and key.char == 'k':
+                            logging.info("Key 'k' pressed. Episode success triggered.")
+                            self.keyboard_events["episode_success"] = True
+                        elif hasattr(key, 'char') and key.char == 'i':
+                            self._handle_intervention_key()
+                        elif key == keyboard.Key.left:
+                            self.keyboard_events["rerecord_episode"] = True
+                except Exception as e:
+                    logging.error(f"Error in keyboard callback: {e}")
+
+            self.listener = keyboard.Listener(on_press=on_press)
+            self.listener.start()
+            logging.info("Global keyboard listener started (pynput)")
+        except ImportError:
+            logging.warning("pynput not available, keyboard shortcuts disabled")
+            self.listener = None
+        except Exception as e:
+            logging.warning(f"Failed to start keyboard listener: {e}")
+            self.listener = None
 
     def _poll_cv2_keys(self):
         """
@@ -1700,8 +1743,8 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         with self.event_lock:
             if key == 27:  # ESC
                 self.keyboard_events["episode_end"] = True
-            elif key == ord('s'):
-                logging.info("Key 's' pressed. Episode success triggered.")
+            elif key == ord('k'):
+                logging.info("Key 'k' pressed. Episode success triggered.")
                 self.keyboard_events["episode_success"] = True
             elif key == 81:  # Left arrow
                 self.keyboard_events["rerecord_episode"] = True
@@ -2481,6 +2524,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     # Use IK reset if robot has MuJoCo model (SO101FollowerEndEffector)
     use_ik_reset = hasattr(cfg.robot, 'mujoco_model_path') and cfg.robot.mujoco_model_path is not None
     ik_reset_ee_pos = getattr(cfg.wrapper, 'ik_reset_ee_pos', None)
+    reset_delay_s = getattr(cfg.wrapper, 'reset_delay_s', 0.0)
 
     env = ResetWrapper(
         env=env,
@@ -2488,6 +2532,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
         reset_time_s=cfg.wrapper.reset_time_s,
         use_ik_reset=use_ik_reset,
         ik_reset_ee_pos=ik_reset_ee_pos,
+        reset_delay_s=reset_delay_s,
     )
 
     env = BatchCompatibleWrapper(env=env)
