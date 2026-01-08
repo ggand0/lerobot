@@ -1705,11 +1705,11 @@ class BaseLeaderControlWrapper(gym.Wrapper):
                 self.keyboard_events["episode_success"] = True
             elif key == 81:  # Left arrow
                 self.keyboard_events["rerecord_episode"] = True
-            elif key == ord(' '):  # Space
-                self._handle_space_key()
+            elif key == ord('i'):  # 'i' for intervention (less accidental than space)
+                self._handle_intervention_key()
 
-    def _handle_space_key(self):
-        """Handle space key press. Override in subclasses for specific behavior."""
+    def _handle_intervention_key(self):
+        """Handle 'i' key press for intervention. Override in subclasses for specific behavior."""
         pass
 
     def _check_intervention(self):
@@ -1907,28 +1907,28 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
 
     def _handle_key_press(self, key, keyboard_device):
         """
-        Handle key presses including space for intervention toggle.
+        Handle key presses including 'i' for intervention toggle.
 
         Args:
             key: The key that was pressed.
             keyboard: The keyboard module with key definitions.
 
-        Extends the base handler to respond to space key for toggling intervention.
+        Extends the base handler to respond to 'i' key for toggling intervention.
         """
         super()._handle_key_press(key, keyboard_device)
 
-    def _handle_space_key(self):
-        """Toggle human intervention mode on space key press."""
+    def _handle_intervention_key(self):
+        """Toggle human intervention mode on 'i' key press."""
         if not self.keyboard_events["human_intervention_step"]:
             logging.info(
-                "Space key pressed. Human intervention required.\n"
-                "Place the leader in similar pose to the follower and press space again."
+                "'i' key pressed. Human intervention required.\n"
+                "Place the leader in similar pose to the follower and press 'i' again."
             )
             self.keyboard_events["human_intervention_step"] = True
             log_say("Human intervention step.", play_sounds=False)
         else:
             self.keyboard_events["human_intervention_step"] = False
-            logging.info("Space key pressed for a second time.\nContinuing with policy actions.")
+            logging.info("'i' key pressed again.\nContinuing with policy actions.")
             log_say("Continuing with policy actions.", play_sounds=False)
 
     def _check_intervention(self):
