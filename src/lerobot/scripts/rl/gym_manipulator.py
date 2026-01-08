@@ -920,27 +920,51 @@ class ResetWrapper(gym.Wrapper):
         # Determine reset pose: use IK if enabled, otherwise use fixed pose
         reset_pose = self.reset_pose
         if self.use_ik_reset and hasattr(self.robot, '_compute_ik'):
-            if self._ik_reset_pose is None:
-                # Compute IK reset pose once and cache it
-                # Get current joint positions as starting point
+            # Use iterative IK to move to target EE position
+            # This keeps joint angles in valid motor range (unlike single-shot IK)
+            logging.info(f"IK reset to EE target: {self.ik_reset_ee_pos}")
+
+            # Get motor names
+            current_pos_dict = self.robot.bus.sync_read("Present_Position")
+            motor_names = list(current_pos_dict.keys())
+
+            # Do iterative IK steps (like send_action does)
+            for step in range(100):  # Max 100 steps
+                # Read current position
                 current_pos_dict = self.robot.bus.sync_read("Present_Position")
-                current_joints_deg = np.array([current_pos_dict[name] for name in current_pos_dict])[:6]
+                current_joints_deg = np.array([current_pos_dict[name] for name in motor_names])[:5]
                 current_joints_rad = np.deg2rad(current_joints_deg)
 
-                # IK only uses arm joints (first 5), not gripper
-                arm_joints_rad = current_joints_rad[:5]
-                gripper_deg = current_joints_deg[5]
+                # Get current EE position
+                self.robot._sync_mujoco(current_joints_rad)
+                current_ee = self.robot._get_ee_position()
 
-                # Sync MuJoCo and compute IK for arm joints
-                self.robot._sync_mujoco(arm_joints_rad)
-                target_arm_rad = self.robot._compute_ik(self.ik_reset_ee_pos, arm_joints_rad)
-                target_arm_deg = np.rad2deg(target_arm_rad)
+                # Check if close enough
+                error = np.linalg.norm(self.ik_reset_ee_pos - current_ee)
+                if error < 0.01:  # 1cm tolerance
+                    logging.info(f"IK reset reached target in {step} steps (error: {error:.4f}m)")
+                    break
 
-                # Append gripper position (keep current or use default open position)
-                self._ik_reset_pose = np.concatenate([target_arm_deg, [gripper_deg]])
-                logging.info(f"Computed IK reset pose for EE target {self.ik_reset_ee_pos}: {self._ik_reset_pose}")
+                # Compute incremental IK step
+                target_joints_rad = self.robot._compute_ik(self.ik_reset_ee_pos, current_joints_rad)
+                target_joints_deg = np.rad2deg(target_joints_rad)
 
-            reset_pose = self._ik_reset_pose
+                # Build action dict and send
+                action_dict = {motor_names[i]: target_joints_deg[i] for i in range(5)}
+                # Keep gripper at current position
+                if len(motor_names) > 5:
+                    action_dict[motor_names[5]] = current_pos_dict[motor_names[5]]
+
+                self.robot.bus.sync_write("Goal_Position", action_dict)
+                busy_wait(0.02)  # 50Hz
+
+            # Also reset leader if present
+            if hasattr(self.env, "robot_leader"):
+                current_pos_dict = self.robot.bus.sync_read("Present_Position")
+                self.env.robot_leader.bus.sync_write("Torque_Enable", 1)
+                reset_follower_position(self.env.robot_leader, np.array([current_pos_dict[n] for n in motor_names]))
+
+            reset_pose = None  # Already moved via IK
 
         if reset_pose is not None:
             log_say("Reset the environment.", play_sounds=False)
