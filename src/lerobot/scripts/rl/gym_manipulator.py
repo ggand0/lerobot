@@ -1457,9 +1457,23 @@ class BaseLeaderControlWrapper(gym.Wrapper):
 
         This method sets up keyboard event handling if not in headless mode.
         """
+        import time
         from pynput import keyboard as keyboard_device
 
+        self._last_key_press_time = {}
+        self._key_debounce_seconds = 0.3  # 300ms debounce
+
         def on_press(key):
+            current_time = time.time()
+            key_str = str(key)
+
+            # Debounce: ignore if same key pressed within debounce period
+            if key_str in self._last_key_press_time:
+                if current_time - self._last_key_press_time[key_str] < self._key_debounce_seconds:
+                    return
+
+            self._last_key_press_time[key_str] = current_time
+
             with self.event_lock:
                 self._handle_key_press(key, keyboard_device)
 
