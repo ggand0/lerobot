@@ -79,19 +79,92 @@ logging.basicConfig(level=logging.INFO)
 # Motor names for IK (5 arm joints, excluding gripper)
 _IK_MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 
+# Calibration for IK degree clamping
+_IK_CALIBRATION_PATH = "/home/gota/.cache/huggingface/lerobot/calibration/robots/so101_follower/ggando_so101_follower.json"
+_IK_CALIBRATION_CACHE = None
+_IK_DEGREE_LIMITS = None
+
+
+def _load_ik_calibration():
+    """Load calibration data for IK degree limits."""
+    global _IK_CALIBRATION_CACHE
+    if _IK_CALIBRATION_CACHE is None:
+        import json
+        with open(_IK_CALIBRATION_PATH) as f:
+            _IK_CALIBRATION_CACHE = json.load(f)
+    return _IK_CALIBRATION_CACHE
+
+
+def _get_degree_limits():
+    """Get valid degree range for each joint from calibration.
+
+    DEGREES mode formula: encoder = (degrees * 4095 / 360) + mid
+    Inverted: degrees = (encoder - mid) * 360 / 4095
+
+    Must prevent:
+    1. Encoder < 0 (causes ValueError in bus)
+    2. Encoder > 4095 (invalid for servo)
+    3. Encoder outside [range_min, range_max] (calibration limits)
+    """
+    cal = _load_ik_calibration()
+    limits = {}
+    for name in _IK_MOTOR_NAMES:
+        range_min = cal[name]["range_min"]
+        range_max = cal[name]["range_max"]
+        mid = (range_min + range_max) / 2
+
+        # Limits from calibration range
+        cal_min_deg = (range_min - mid) * 360 / 4095
+        cal_max_deg = (range_max - mid) * 360 / 4095
+
+        # Limits to prevent negative/overflow encoder (encoder in [0, 4095])
+        enc_min_deg = (0 - mid) * 360 / 4095      # encoder = 0
+        enc_max_deg = (4095 - mid) * 360 / 4095   # encoder = 4095
+
+        # Take most restrictive limits
+        min_deg = max(cal_min_deg, enc_min_deg)
+        max_deg = min(cal_max_deg, enc_max_deg)
+
+        limits[name] = (min_deg, max_deg)
+    return limits
+
+
+def _clamp_degrees(joints_deg: np.ndarray) -> np.ndarray:
+    """Clamp degree values to valid encoder range.
+
+    DEGREES mode in motors_bus.py doesn't clamp values, so out-of-range
+    degree values produce invalid encoder positions that motors reject.
+    """
+    global _IK_DEGREE_LIMITS
+    if _IK_DEGREE_LIMITS is None:
+        _IK_DEGREE_LIMITS = _get_degree_limits()
+    clamped = joints_deg.copy()
+    for i, name in enumerate(_IK_MOTOR_NAMES):
+        min_deg, max_deg = _IK_DEGREE_LIMITS[name]
+        clamped[i] = np.clip(joints_deg[i], min_deg, max_deg)
+    return clamped
+
 
 def reset_follower_position(robot_arm, target_position):
     current_position_dict = robot_arm.bus.sync_read("Present_Position")
     current_position = np.array(
         [current_position_dict[name] for name in current_position_dict], dtype=np.float32
     )
+    logging.info(f"reset_follower_position: current={current_position}, target={target_position}")
+    # Use slow movement for reliable reaching
     trajectory = torch.from_numpy(
-        np.linspace(current_position, target_position, 50)
-    )  # NOTE: 30 is just an arbitrary number
-    for pose in trajectory:
+        np.linspace(current_position, target_position, 150)
+    )
+    for i, pose in enumerate(trajectory):
         action_dict = dict(zip(current_position_dict, pose, strict=False))
         robot_arm.bus.sync_write("Goal_Position", action_dict)
-        busy_wait(0.015)
+        busy_wait(0.025)  # 25ms per step = 3.75 seconds total
+    # Extra settle time
+    busy_wait(0.5)
+    # Verify final position
+    final_pos_dict = robot_arm.bus.sync_read("Present_Position")
+    final_pos = np.array([final_pos_dict[name] for name in final_pos_dict], dtype=np.float32)
+    logging.info(f"reset_follower_position: final={final_pos}, diff={np.abs(final_pos - target_position).max():.2f}")
 
 
 class TorchBox(gym.spaces.Box):
@@ -928,27 +1001,60 @@ class ResetWrapper(gym.Wrapper):
         reset_pose = self.reset_pose
         if self.use_ik_reset and hasattr(self.robot, '_compute_ik'):
             # ================================================================
-            # TWO-STEP IK RESET (matching rl_inference.py pattern)
-            # Step 1: Move to fixed reset pose first (known good configuration)
-            # Step 2: Apply IK to fine-tune to target EE position
+            # THREE-STEP IK RESET (matching rl_inference.py pattern exactly)
+            # Step 1: Move to SAFE_JOINTS (all zeros) - extended forward position
+            # Step 2: Set wrist to π/2 for top-down orientation
+            # Step 3: Apply IK to move to target EE position
             #
             # NOTE: SO101FollowerEndEffector uses DEGREES mode for bus I/O,
             # so we use simple np.deg2rad/np.rad2deg (NOT calibration conversion).
             # ================================================================
             logging.info(f"IK reset to EE target: {self.ik_reset_ee_pos}")
 
-            # ============================================================
-            # STEP 1: Move to fixed reset pose first (like rl_inference.py)
-            # This gets the robot to a known good configuration before IK
-            # ============================================================
-            if self.reset_pose is not None:
-                logging.info("IK reset step 1: Moving to fixed reset pose")
-                reset_follower_position(self.unwrapped.robot, self.reset_pose)
-                busy_wait(0.5)  # Let robot settle
+            # Check torque status
+            torque_status = self.robot.bus.sync_read("Torque_Enable")
+            logging.info(f"Motor torque status: {torque_status}")
 
             # ============================================================
-            # STEP 2: Apply closed-loop IK from the good starting pose
+            # STEP 1: Move to SAFE_JOINTS (all zeros) - like rl_inference.py
+            # SAFE_JOINTS = np.zeros(5) in radians = [0, 0, 0, 0, 0] degrees
             # ============================================================
+            logging.info("IK reset step 1: Moving to SAFE_JOINTS (all zeros)")
+            safe_joints_deg = np.array([0.0, 0.0, 0.0, 0.0, 0.0])  # All zeros
+            safe_joints_deg = _clamp_degrees(safe_joints_deg)  # Clamp to valid range
+
+            action_dict = {name: safe_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
+            action_dict["gripper"] = 50.0  # Open gripper
+            logging.info(f"Step 1 sending: {action_dict}")
+            self.robot.bus.sync_write("Goal_Position", action_dict)
+            busy_wait(1.5)  # Wait for robot to reach safe position
+
+            pos_dict = self.robot.bus.sync_read("Present_Position")
+            logging.info(f"Step 1 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
+
+            # ============================================================
+            # STEP 2: Set wrist to π/2 for top-down orientation
+            # wrist_flex (joint 3) = 90°, wrist_roll (joint 4) = -90°
+            # ============================================================
+            logging.info("IK reset step 2: Setting top-down wrist orientation")
+            topdown_joints_deg = np.array([pos_dict[name] for name in _IK_MOTOR_NAMES])
+            topdown_joints_deg[3] = 90.0   # wrist_flex = π/2
+            topdown_joints_deg[4] = -90.0  # wrist_roll = -π/2 (flipped for real robot)
+            topdown_joints_deg = _clamp_degrees(topdown_joints_deg)
+
+            action_dict = {name: topdown_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
+            action_dict["gripper"] = 50.0
+            logging.info(f"Step 2 sending: {action_dict}")
+            self.robot.bus.sync_write("Goal_Position", action_dict)
+            busy_wait(1.0)
+
+            pos_dict = self.robot.bus.sync_read("Present_Position")
+            logging.info(f"Step 2 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
+
+            # ============================================================
+            # STEP 3: Apply closed-loop IK to reach target EE position
+            # ============================================================
+            logging.info(f"IK reset step 3: Moving to EE target {self.ik_reset_ee_pos}")
             ik_converged = False
             prev_error = float('inf')
             stuck_count = 0
@@ -967,7 +1073,7 @@ class ResetWrapper(gym.Wrapper):
                 error = np.linalg.norm(self.ik_reset_ee_pos - current_ee)
 
                 if ik_step == 0:
-                    logging.info(f"IK reset step 2: EE={current_ee}, error={error:.4f}m")
+                    logging.info(f"Step 3 start: EE={current_ee}, error={error:.4f}m")
 
                 # Converged within 1.5cm
                 if error < 0.015:
@@ -992,24 +1098,35 @@ class ResetWrapper(gym.Wrapper):
                 # 5. Convert back to degrees (simple rad2deg - bus expects DEGREES!)
                 target_joints_deg = np.rad2deg(target_joints_rad)
 
-                # Debug: log progress
-                if ik_step < 3 or ik_step % 10 == 0:
-                    logging.info(f"IK step {ik_step}: error={error:.4f}m, EE={current_ee}")
+                # 6. Clamp delta to max 10° per step so robot can keep up
+                delta_deg = target_joints_deg - current_joints_deg
+                max_delta = 10.0  # degrees per step
+                delta_deg = np.clip(delta_deg, -max_delta, max_delta)
+                target_joints_deg = current_joints_deg + delta_deg
 
-                # 6. Build action dict and send to robot
+                # 6b. Clamp to valid encoder range (DEGREES mode doesn't clamp!)
+                target_joints_deg = _clamp_degrees(target_joints_deg)
+
+                # 7. Build action dict and send to robot
                 gripper_pos = current_pos_dict.get("gripper", 50.0)
                 action_dict = {name: target_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
                 action_dict["gripper"] = gripper_pos
+
+                # Log progress every 10 steps
+                if ik_step % 10 == 0:
+                    logging.info(f"Step 3 iter {ik_step}: error={error:.4f}m, EE={current_ee}")
+
                 self.robot.bus.sync_write("Goal_Position", action_dict)
 
-                # 7. Wait for robot to move
-                busy_wait(0.05)
+                # 8. Wait for robot to move (100ms to allow motor movement)
+                busy_wait(0.1)
 
             if not ik_converged:
                 logging.warning(f"IK reset did not fully converge, final error={error:.4f}m")
 
-            # IK reset already moved the robot, skip reset_follower_position below
-            reset_pose = None
+            # IK reset complete, return immediately
+            logging.info("IK reset complete")
+            return super().reset(seed=seed, options=options)
 
         if reset_pose is not None:
             log_say("Reset the environment.", play_sounds=False)
