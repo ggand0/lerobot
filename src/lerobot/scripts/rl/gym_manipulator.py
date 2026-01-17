@@ -1050,12 +1050,12 @@ class ResetWrapper(gym.Wrapper):
 
             # ============================================================
             # STEP 2: Set wrist to π/2 for top-down orientation
-            # wrist_flex (joint 3) = 90°, wrist_roll (joint 4) = -90°
+            # wrist_flex (joint 3) = 90°, wrist_roll (joint 4) = 90°
             # ============================================================
             logging.info("IK reset step 2: Setting top-down wrist orientation")
             topdown_joints_deg = np.array([pos_dict[name] for name in _IK_MOTOR_NAMES])
             topdown_joints_deg[3] = 90.0   # wrist_flex = π/2
-            topdown_joints_deg[4] = -90.0  # wrist_roll = -π/2 (flipped for real robot)
+            topdown_joints_deg[4] = 90.0   # wrist_roll = π/2 (corrected assembly)
             topdown_joints_deg = _clamp_degrees(topdown_joints_deg)
 
             action_dict = {name: topdown_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
@@ -1142,6 +1142,7 @@ class ResetWrapper(gym.Wrapper):
 
             # IK reset complete
             logging.info("IK reset complete")
+            log_say("Episode starting", play_sounds=True)
 
             # Wait for user to reposition objects if delay configured
             if self.reset_delay_s > 0:
@@ -1903,6 +1904,9 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         if success:
             reward = 1.0
             logging.info("Episode ended successfully with reward 1.0")
+            log_say("Episode success", play_sounds=True)
+        elif terminated or truncated:
+            log_say("Episode ended", play_sounds=True)
 
         # Propagate rerecord signal to info for recording loop
         info["rerecord_episode"] = rerecord
