@@ -141,21 +141,34 @@ class OpenCVCamera(Camera):
         return isinstance(self.videocapture, cv2.VideoCapture) and self.videocapture.isOpened()
 
     def _try_open_camera(self, device_path: str | int) -> bool:
-        """Try to open a camera device and verify it can read frames."""
+        """Try to open a camera device and verify it can read valid frames."""
         try:
             cap = cv2.VideoCapture(device_path, self.backend)
             if not cap.isOpened():
                 cap.release()
                 return False
-            # Try to read a frame to verify the device actually works
-            ret, _ = cap.read()
+            # Try to read multiple frames to ensure stability (metadata devices often fail)
+            for _ in range(3):
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    cap.release()
+                    return False
+                # Check frame has valid dimensions (metadata devices return empty/tiny frames)
+                if frame.shape[0] < 100 or frame.shape[1] < 100:
+                    cap.release()
+                    return False
+                time.sleep(0.05)
             cap.release()
-            return ret
+            return True
         except Exception:
             return False
 
     def _find_working_camera(self) -> str | None:
-        """Scan /dev/video* devices and return the first one that works."""
+        """Scan /dev/video* devices and return the first one that works.
+
+        Skips metadata devices by checking for valid frame reads.
+        USB cameras typically have pairs: video0 (camera) + video1 (metadata).
+        """
         import glob
         video_devices = sorted(glob.glob("/dev/video*"))
         for device in video_devices:
@@ -163,6 +176,8 @@ class OpenCVCamera(Camera):
             if self._try_open_camera(device):
                 logger.info(f"Found working camera: {device}")
                 return device
+            else:
+                logger.info(f"Skipping {device} (metadata or non-functional)")
         return None
 
     def connect(self, warmup: bool = True):
