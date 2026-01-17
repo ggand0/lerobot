@@ -270,7 +270,14 @@ class SO101FollowerEndEffector(SO101Follower):
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
+            try:
+                obs_dict[cam_key] = cam.async_read()
+            except TimeoutError as e:
+                logger.error(f"Camera {cam_key} timeout - USB may need reset. Unplug and replug the camera.")
+                raise RuntimeError(
+                    f"Camera {cam_key} stopped responding. "
+                    f"Please unplug and replug the USB camera, then restart."
+                ) from e
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
