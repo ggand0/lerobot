@@ -140,12 +140,38 @@ class OpenCVCamera(Camera):
         """Checks if the camera is currently connected and opened."""
         return isinstance(self.videocapture, cv2.VideoCapture) and self.videocapture.isOpened()
 
+    def _try_open_camera(self, device_path: str | int) -> bool:
+        """Try to open a camera device and verify it can read frames."""
+        try:
+            cap = cv2.VideoCapture(device_path, self.backend)
+            if not cap.isOpened():
+                cap.release()
+                return False
+            # Try to read a frame to verify the device actually works
+            ret, _ = cap.read()
+            cap.release()
+            return ret
+        except Exception:
+            return False
+
+    def _find_working_camera(self) -> str | None:
+        """Scan /dev/video* devices and return the first one that works."""
+        import glob
+        video_devices = sorted(glob.glob("/dev/video*"))
+        for device in video_devices:
+            logger.info(f"Trying camera device: {device}")
+            if self._try_open_camera(device):
+                logger.info(f"Found working camera: {device}")
+                return device
+        return None
+
     def connect(self, warmup: bool = True):
         """
         Connects to the OpenCV camera specified in the configuration.
 
         Initializes the OpenCV VideoCapture object, sets desired camera properties
-        (FPS, width, height), and performs initial checks.
+        (FPS, width, height), and performs initial checks. If the specified device
+        fails, automatically scans for working camera devices.
 
         Raises:
             DeviceAlreadyConnectedError: If the camera is already connected.
@@ -164,8 +190,24 @@ class OpenCVCamera(Camera):
         if not self.videocapture.isOpened():
             self.videocapture.release()
             self.videocapture = None
+            # Try auto-detection
+            logger.warning(f"Failed to open {self.index_or_path}, scanning for available cameras...")
+            working_device = self._find_working_camera()
+            if working_device:
+                logger.info(f"Auto-detected camera: {working_device}")
+                self.index_or_path = working_device
+                self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+            else:
+                raise ConnectionError(
+                    f"Failed to open {self} and no working cameras found. "
+                    f"Run `python -m lerobot.find_cameras opencv` to find available cameras."
+                )
+
+        if not self.videocapture.isOpened():
+            self.videocapture.release()
+            self.videocapture = None
             raise ConnectionError(
-                f"Failed to open {self}."
+                f"Failed to open {self}. "
                 f"Run `python -m lerobot.find_cameras opencv` to find available cameras."
             )
 
