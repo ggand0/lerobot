@@ -26,6 +26,28 @@ from lerobot.configs.types import NormalizationMode
 from lerobot.constants import ACTION, OBS_IMAGE, OBS_STATE
 
 
+@dataclass
+class ConcurrencyConfig:
+    """Configuration for the concurrency of the actor and learner.
+    Possible values are:
+    - "threads": Use threads for the actor and learner.
+    - "processes": Use processes for the actor and learner.
+    """
+
+    actor: str = "threads"
+    learner: str = "threads"
+
+
+@dataclass
+class ActorLearnerConfig:
+    """Configuration for actor-learner distributed training."""
+
+    learner_host: str = "127.0.0.1"
+    learner_port: int = 50051
+    policy_parameters_push_frequency: int = 4
+    queue_get_timeout: float = 2
+
+
 @PreTrainedConfig.register_subclass("drqv2")
 @dataclass
 class DrQV2Config(PreTrainedConfig):
@@ -108,6 +130,7 @@ class DrQV2Config(PreTrainedConfig):
     # Online training settings
     online_steps: int = 1000000
     online_buffer_capacity: int = 100000
+    offline_buffer_capacity: int = 50000  # Capacity for offline demonstration buffer
     online_step_before_learning: int = 100
     policy_update_freq: int = 1
 
@@ -118,12 +141,16 @@ class DrQV2Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # DrQ-v2 trains the encoder
     grad_clip_norm: float = 1.0  # Gradient clipping
     utd_ratio: int = 1  # Update-to-data ratio (critic updates per env step)
+    async_prefetch: bool = False  # Async prefetching for replay buffer
 
     # Pretrained model path (used when loading from checkpoint)
     pretrained_path: str | None = None
 
     # Actor-learner config for distributed training (HIL-SERL)
-    actor_learner_config: dict | None = None
+    actor_learner_config: ActorLearnerConfig = field(default_factory=ActorLearnerConfig)
+
+    # Concurrency config for distributed training
+    concurrency: ConcurrencyConfig = field(default_factory=ConcurrencyConfig)
 
     def __post_init__(self):
         super().__post_init__()
