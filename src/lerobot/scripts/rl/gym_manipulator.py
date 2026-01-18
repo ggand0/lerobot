@@ -457,6 +457,16 @@ class RobotEnv(gym.Env):
         if leader_positions:
             # Intervention mode: mirror leader joint positions directly
             joint_action = {f"{name}.pos": pos for name, pos in leader_positions.items()}
+
+            # Enforce locked joints if configured (override leader positions for locked joints)
+            locked_joints = getattr(self.robot.config, 'locked_joints', None)
+            if locked_joints:
+                motor_names = list(self.robot.bus.motors.keys())
+                for joint_idx in locked_joints:
+                    if joint_idx < len(motor_names):
+                        motor_name = motor_names[joint_idx]
+                        joint_action[f"{motor_name}.pos"] = 90.0  # Lock at 90°
+
             self.robot.send_action(joint_action)
             self._leader_positions = None  # Clear after use
         else:
@@ -886,7 +896,7 @@ class ImageResizeWrapper(gym.Wrapper):
                 if device == torch.device("mps:0"):
                     obs[k] = obs[k].cpu()
                 obs[k] = F.resize(obs[k], self.resize_size)
-                obs[k] = obs[k].clamp(0.0, 1.0)
+                # Note: removed clamp(0, 1) to support both [0, 1] and [0, 255] image ranges
                 obs[k] = obs[k].to(device)
         return obs, reward, terminated, truncated, info
 
@@ -898,7 +908,7 @@ class ImageResizeWrapper(gym.Wrapper):
                 if device == torch.device("mps:0"):
                     obs[k] = obs[k].cpu()
                 obs[k] = F.resize(obs[k], self.resize_size)
-                obs[k] = obs[k].clamp(0.0, 1.0)
+                # Note: removed clamp(0, 1) to support both [0, 1] and [0, 255] image ranges
                 obs[k] = obs[k].to(device)
         return obs, info
 
@@ -911,17 +921,20 @@ class ConvertToLeRobotObservation(gym.ObservationWrapper):
     including normalizing image values and moving tensors to the specified device.
     """
 
-    def __init__(self, env, device: str = "cpu"):
+    def __init__(self, env, device: str = "cpu", normalize_images: bool = True):
         """
         Initialize the LeRobot observation converter.
 
         Args:
             env: The environment to wrap.
             device: Target device for the observation tensors.
+            normalize_images: If True, normalize images to [0, 1]. If False, keep as float32 [0, 255].
+                Set to False when using encoders that do their own normalization (e.g., DrQ-v2).
         """
         super().__init__(env)
 
         self.device = torch.device(device)
+        self.normalize_images = normalize_images
 
         # Update observation space to reflect CHW format after preprocessing
         # preprocess_observation converts images from HWC to CHW
@@ -930,8 +943,9 @@ class ConvertToLeRobotObservation(gym.ObservationWrapper):
             if "image" in key and isinstance(space, gym.spaces.Box) and len(space.shape) == 3:
                 h, w, c = space.shape
                 # Convert HWC to CHW
+                high = 1.0 if normalize_images else 255.0
                 new_observation_space[key] = gym.spaces.Box(
-                    low=0.0, high=1.0, shape=(c, h, w), dtype=np.float32
+                    low=0.0, high=high, shape=(c, h, w), dtype=np.float32
                 )
             else:
                 new_observation_space[key] = space
@@ -947,7 +961,7 @@ class ConvertToLeRobotObservation(gym.ObservationWrapper):
         Returns:
             The processed observation with normalized images and proper tensor formats.
         """
-        observation = preprocess_observation(observation)
+        observation = preprocess_observation(observation, normalize_images=self.normalize_images)
         observation = {
             key: observation[key].to(self.device, non_blocking=self.device.type == "cuda")
             for key in observation
@@ -2538,7 +2552,9 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
                 if hasattr(robot.config, 'urdf_path') and robot.config.urdf_path is not None:
                     env = EEObservationWrapper(env=env, ee_pose_limits=robot.end_effector_bounds)
 
-    env = ConvertToLeRobotObservation(env=env, device=cfg.device)
+    # normalize_images=False keeps images as float32 [0, 255] for encoders with normalise_inputs=True (DrQ-v2)
+    normalize_images = cfg.wrapper.normalize_images if cfg.wrapper else True
+    env = ConvertToLeRobotObservation(env=env, device=cfg.device, normalize_images=normalize_images)
 
     if cfg.wrapper and cfg.wrapper.crop_params_dict is not None:
         env = ImageCropResizeWrapper(

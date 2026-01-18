@@ -1197,6 +1197,7 @@ def initialize_offline_replay_buffer(
     # Get full proprioception config
     compute_full_proprioception = False
     convert_to_radians = False
+    unnormalize_images = False
     mujoco_model_path = None
     ee_site_name = "gripper"
     fps = 30.0
@@ -1204,6 +1205,12 @@ def initialize_offline_replay_buffer(
     if hasattr(cfg, "env") and hasattr(cfg.env, "wrapper"):
         compute_full_proprioception = getattr(cfg.env.wrapper, "add_full_proprioception", False)
         convert_to_radians = getattr(cfg.env.wrapper, "use_radians", False)
+        # When normalize_images=False in live env, we need to unnormalize dataset images
+        # (dataset stores images in [0,1] but encoder expects [0,255])
+        normalize_images = getattr(cfg.env.wrapper, "normalize_images", True)
+        unnormalize_images = not normalize_images
+        if unnormalize_images:
+            logging.info("Unnormalizing dataset images from [0,1] to [0,255] (normalize_images=False)")
 
     # Get MuJoCo model path from robot config (needed for full proprioception and action conversion)
     if hasattr(cfg, "env") and hasattr(cfg.env, "robot"):
@@ -1301,6 +1308,7 @@ def initialize_offline_replay_buffer(
         ee_action_scale=ee_action_scale,
         target_action_dim=target_action_dim,
         frame_stack=frame_stack,
+        unnormalize_images=unnormalize_images,
     )
 
     # Save to cache for future runs
