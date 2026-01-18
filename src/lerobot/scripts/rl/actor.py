@@ -441,6 +441,30 @@ def act_with_policy(
     policy = policy.eval()
     assert isinstance(policy, nn.Module)
 
+    # Wait for initial parameters from learner (critical for pretrained policies)
+    # This blocks until the learner pushes the first policy parameters
+    logging.info("[ACTOR] Waiting for initial parameters from Learner...")
+    timeout_seconds = cfg.policy.actor_learner_config.queue_get_timeout
+    try:
+        bytes_state_dict = parameters_queue.get(block=True, timeout=timeout_seconds * 5)
+        state_dicts = bytes_to_state_dict(bytes_state_dict)
+
+        # Load actor state dict
+        actor_state_dict = move_state_dict_to_device(state_dicts["policy"], device=device)
+        policy.actor.load_state_dict(actor_state_dict)
+
+        # Load encoder if present (needed for DrQ-v2)
+        if hasattr(policy, "encoder") and "encoder" in state_dicts:
+            encoder_state_dict = move_state_dict_to_device(
+                state_dicts["encoder"], device=device
+            )
+            policy.encoder.load_state_dict(encoder_state_dict)
+            logging.info("[ACTOR] Loaded encoder parameters from Learner.")
+
+        logging.info("[ACTOR] Loaded initial parameters from Learner.")
+    except Empty:
+        logging.warning("[ACTOR] Timeout waiting for initial parameters, using random weights")
+
     # Initialize frame stack buffer if frame_stack > 1
     frame_stack = getattr(cfg.policy, "frame_stack", 1)
     frame_stack_buffer = None
@@ -848,6 +872,14 @@ def update_policy_parameters(policy: SACPolicy, parameters_queue: Queue, device)
         # Load actor state dict
         actor_state_dict = move_state_dict_to_device(state_dicts["policy"], device=device)
         policy.actor.load_state_dict(actor_state_dict)
+
+        # Load encoder if present (needed for DrQ-v2 which trains encoder end-to-end)
+        if hasattr(policy, "encoder") and "encoder" in state_dicts:
+            encoder_state_dict = move_state_dict_to_device(
+                state_dicts["encoder"], device=device
+            )
+            policy.encoder.load_state_dict(encoder_state_dict)
+            logging.info("[ACTOR] Loaded encoder parameters from Learner.")
 
         # Load discrete critic if present
         if hasattr(policy, "discrete_critic") and "discrete_critic" in state_dicts:
