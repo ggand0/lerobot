@@ -345,16 +345,33 @@ def add_actor_information_and_train(
     if pretrained_path:
         logging.info(f"[LEARNER] Loading pretrained weights from {pretrained_path}")
         checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
+
+        # Check if we should skip loading critic weights (for sim-to-real transfer)
+        skip_pretrained_critic = getattr(cfg.policy, "skip_pretrained_critic", False)
+        if skip_pretrained_critic:
+            logging.info("[LEARNER] Skipping pretrained critic weights (training from scratch)")
+
         if "agent" in checkpoint:
             # RoboBase/Genesis format
+            agent_state = checkpoint["agent"]
+            if skip_pretrained_critic:
+                # Filter out critic weights - they don't transfer well from sim to real
+                agent_state = {k: v for k, v in agent_state.items()
+                              if not k.startswith(("critic.", "critic_target."))}
+                logging.info(f"[LEARNER] Filtered to {len(agent_state)} weights (excluding critic)")
+
             if hasattr(policy, "_load_robobase_weights"):
-                policy._load_robobase_weights(checkpoint["agent"])
+                policy._load_robobase_weights(agent_state)
                 logging.info("[LEARNER] Loaded RoboBase pretrained weights")
             else:
                 logging.warning("[LEARNER] Policy does not support RoboBase weight loading")
         else:
             # Direct state dict format
-            policy.load_state_dict(checkpoint, strict=False)
+            state_dict = checkpoint
+            if skip_pretrained_critic:
+                state_dict = {k: v for k, v in state_dict.items()
+                             if not k.startswith(("critic.", "critic_target."))}
+            policy.load_state_dict(state_dict, strict=False)
             logging.info("[LEARNER] Loaded pretrained state dict")
 
     policy.train()
