@@ -157,8 +157,15 @@ def make_policy(
             )
         features = env_to_policy_features(env_cfg)
 
+    # Set output_features from env/dataset features (action shape doesn't change with frame stacking)
     cfg.output_features = {key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION}
-    cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+
+    # Only set input_features from env if not already configured in policy config
+    # This allows frame-stacked policies to specify their own input shapes (e.g., [54] for 18*3 frames)
+    # while the environment produces single-frame observations (e.g., [18])
+    if not cfg.input_features:
+        cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
+
     kwargs["config"] = cfg
 
     if cfg.pretrained_path:
