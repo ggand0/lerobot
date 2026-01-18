@@ -49,6 +49,7 @@ https://github.com/michel-aractingi/lerobot-hilserl-guide
 import logging
 import os
 import time
+from collections import deque
 from functools import lru_cache
 from queue import Empty
 
@@ -97,6 +98,57 @@ ACTOR_SHUTDOWN_TIMEOUT = 30
 SAFE_JOINTS_RAD = np.zeros(5)
 # Rest joint positions (radians) - matches rl_inference.py REST_JOINTS
 REST_JOINTS_RAD = np.array([-0.2424, -1.8040, 1.6582, 0.7309, -0.0629])
+
+
+class FrameStackBuffer:
+    """Buffer for stacking frames across timesteps."""
+
+    def __init__(self, frame_stack: int, image_keys: list[str], state_key: str = "observation.state"):
+        self.frame_stack = frame_stack
+        self.image_keys = image_keys
+        self.state_key = state_key
+        self.image_buffers = {key: deque(maxlen=frame_stack) for key in image_keys}
+        self.state_buffer = deque(maxlen=frame_stack)
+
+    def reset(self, obs: dict) -> dict:
+        """Reset buffer with initial observation, filling with copies."""
+        for key in self.image_keys:
+            self.image_buffers[key].clear()
+            for _ in range(self.frame_stack):
+                self.image_buffers[key].append(obs[key].clone() if hasattr(obs[key], 'clone') else obs[key].copy())
+        self.state_buffer.clear()
+        for _ in range(self.frame_stack):
+            self.state_buffer.append(obs[self.state_key].clone() if hasattr(obs[self.state_key], 'clone') else obs[self.state_key].copy())
+        return self._get_stacked_obs(obs)
+
+    def update(self, obs: dict) -> dict:
+        """Add new observation to buffer and return stacked observation."""
+        for key in self.image_keys:
+            self.image_buffers[key].append(obs[key].clone() if hasattr(obs[key], 'clone') else obs[key].copy())
+        self.state_buffer.append(obs[self.state_key].clone() if hasattr(obs[self.state_key], 'clone') else obs[self.state_key].copy())
+        return self._get_stacked_obs(obs)
+
+    def _get_stacked_obs(self, obs: dict) -> dict:
+        """Stack frames along channel dimension for images, and concatenate states."""
+        stacked = {}
+        for key in self.image_keys:
+            # Stack along channel dimension: (C, H, W) × N -> (C*N, H, W)
+            frames = list(self.image_buffers[key])
+            if hasattr(frames[0], 'shape'):
+                stacked[key] = torch.cat(frames, dim=0) if isinstance(frames[0], torch.Tensor) else np.concatenate(frames, axis=0)
+            else:
+                stacked[key] = frames[-1]  # Fallback
+        # Concatenate state: (D,) × N -> (D*N,)
+        states = list(self.state_buffer)
+        if hasattr(states[0], 'shape'):
+            stacked[self.state_key] = torch.cat(states, dim=0) if isinstance(states[0], torch.Tensor) else np.concatenate(states, axis=0)
+        else:
+            stacked[self.state_key] = states[-1]  # Fallback
+        # Copy any other keys unchanged
+        for key, value in obs.items():
+            if key not in stacked:
+                stacked[key] = value
+        return stacked
 
 
 #################################################
@@ -355,7 +407,25 @@ def act_with_policy(
     policy = policy.eval()
     assert isinstance(policy, nn.Module)
 
+    # Initialize frame stack buffer if frame_stack > 1
+    frame_stack = getattr(cfg.policy, "frame_stack", 1)
+    frame_stack_buffer = None
+    if frame_stack > 1:
+        # Find image keys from env features
+        image_keys = [k for k in cfg.env.features.keys() if "image" in k.lower()]
+        if image_keys:
+            frame_stack_buffer = FrameStackBuffer(
+                frame_stack=frame_stack,
+                image_keys=image_keys,
+                state_key="observation.state",
+            )
+            logging.info(f"[ACTOR] Frame stacking enabled: {frame_stack} frames, image_keys={image_keys}")
+
     obs, info = online_env.reset()
+
+    # Stack frames if buffer is enabled
+    if frame_stack_buffer is not None:
+        obs = frame_stack_buffer.reset(obs)
 
     # NOTE: For the moment we will solely handle the case of a single environment
     sum_reward_episode = 0
@@ -387,6 +457,11 @@ def act_with_policy(
 
             next_obs, reward, done, truncated, info = online_env.step(action)
 
+            # Stack next_obs for policy inference
+            next_obs_stacked = next_obs
+            if frame_stack_buffer is not None:
+                next_obs_stacked = frame_stack_buffer.update(next_obs)
+
             sum_reward_episode += float(reward)
             # Increment total steps counter for intervention rate
             episode_total_steps += 1
@@ -400,19 +475,20 @@ def act_with_policy(
                 # Increment intervention steps counter
                 episode_intervention_steps += 1
 
+            # Store stacked observations in transitions for consistency with learner
             list_transition_to_send_to_learner.append(
                 Transition(
                     state=obs,
                     action=action,
                     reward=reward,
-                    next_state=next_obs,
+                    next_state=next_obs_stacked,
                     done=done,
                     truncated=truncated,  # TODO: (azouitine) Handle truncation properly
                     complementary_info=info,
                 )
             )
-            # assign obs to the next obs and continue the rollout
-            obs = next_obs
+            # assign obs to the next stacked obs and continue the rollout
+            obs = next_obs_stacked
 
             if done or truncated:
                 logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
@@ -453,6 +529,9 @@ def act_with_policy(
                 episode_intervention_steps = 0
                 episode_total_steps = 0
                 obs, info = online_env.reset()
+                # Reset frame stack buffer on episode boundary
+                if frame_stack_buffer is not None:
+                    obs = frame_stack_buffer.reset(obs)
 
             if cfg.env.fps is not None:
                 dt_time = time.perf_counter() - start_time
