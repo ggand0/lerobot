@@ -439,6 +439,7 @@ class ReplayBuffer:
         optimize_memory: bool = False,
         image_size: tuple[int, int] | None = None,
         compute_full_proprioception: bool = False,
+        convert_to_radians: bool = False,
         mujoco_model_path: str | None = None,
         ee_site_name: str = "gripper",
         fps: float = 30.0,
@@ -465,6 +466,8 @@ class ReplayBuffer:
             optimize_memory (bool): If True, reduces memory usage by not duplicating state data.
             image_size (tuple[int, int] | None): Target size (H, W) to resize images. If None, no resize.
             compute_full_proprioception (bool): If True, expand state to 18-dim with vel and FK.
+            convert_to_radians (bool): If True, convert joint positions/velocities to radians.
+                Required when using RoboBase/Genesis pretrained checkpoints which expect radians.
             mujoco_model_path (str | None): Path to MuJoCo model for FK computation.
             ee_site_name (str): End-effector site name in MuJoCo model.
             fps (float): Dataset FPS for velocity computation.
@@ -620,7 +623,7 @@ class ReplayBuffer:
                     joint_pos = val.numpy()  # 6-dim joint positions (degrees)
                     num_dof = len(joint_pos)
 
-                    # Convert to radians for MuJoCo
+                    # Convert to radians for MuJoCo FK
                     joint_pos_rad = np.deg2rad(joint_pos)
 
                     # Compute velocity (finite difference)
@@ -640,7 +643,14 @@ class ReplayBuffer:
                     ee_euler = rotation_matrix_to_euler(xmat)
 
                     # Concatenate into 18-dim full proprioceptive state
-                    full_state = np.concatenate([joint_pos, joint_vel, ee_xyz, ee_euler])
+                    # Use radians if requested (for RoboBase/Genesis pretrained models)
+                    if convert_to_radians:
+                        joint_pos_final = joint_pos_rad
+                        joint_vel_final = np.deg2rad(joint_vel)  # deg/s -> rad/s
+                    else:
+                        joint_pos_final = joint_pos
+                        joint_vel_final = joint_vel
+                    full_state = np.concatenate([joint_pos_final, joint_vel_final, ee_xyz, ee_euler])
                     val = torch.from_numpy(full_state).float()
 
                 current_state[key] = val.unsqueeze(0).to(storage_device)
