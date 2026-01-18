@@ -129,21 +129,55 @@ class FrameStackBuffer:
         return self._get_stacked_obs(obs)
 
     def _get_stacked_obs(self, obs: dict) -> dict:
-        """Stack frames along channel dimension for images, and concatenate states."""
+        """Stack frames along channel dimension for images, and concatenate states.
+
+        Images from env have shape (B, C, H, W) with B=1 after preprocessing.
+        Stack along dim=1 (channel): (B, C, H, W) × N -> (B, C*N, H, W)
+
+        States have shape (B, D) with B=1.
+        Stack along dim=1 (feature): (B, D) × N -> (B, D*N)
+        """
         stacked = {}
         for key in self.image_keys:
-            # Stack along channel dimension: (C, H, W) × N -> (C*N, H, W)
             frames = list(self.image_buffers[key])
             if hasattr(frames[0], 'shape'):
-                stacked[key] = torch.cat(frames, dim=0) if isinstance(frames[0], torch.Tensor) else np.concatenate(frames, axis=0)
+                if isinstance(frames[0], torch.Tensor):
+                    # Check if batch dim exists: (B, C, H, W) vs (C, H, W)
+                    if frames[0].dim() == 4:
+                        # Has batch dim - stack along channel dim (dim=1)
+                        stacked[key] = torch.cat(frames, dim=1)
+                    else:
+                        # No batch dim - stack along dim=0 (channel)
+                        stacked[key] = torch.cat(frames, dim=0)
+                else:
+                    # Numpy array
+                    if frames[0].ndim == 4:
+                        stacked[key] = np.concatenate(frames, axis=1)
+                    else:
+                        stacked[key] = np.concatenate(frames, axis=0)
             else:
                 stacked[key] = frames[-1]  # Fallback
-        # Concatenate state: (D,) × N -> (D*N,)
+
+        # Concatenate state along feature dimension
         states = list(self.state_buffer)
         if hasattr(states[0], 'shape'):
-            stacked[self.state_key] = torch.cat(states, dim=0) if isinstance(states[0], torch.Tensor) else np.concatenate(states, axis=0)
+            if isinstance(states[0], torch.Tensor):
+                # Check if batch dim exists: (B, D) vs (D,)
+                if states[0].dim() == 2:
+                    # Has batch dim - stack along feature dim (dim=1)
+                    stacked[self.state_key] = torch.cat(states, dim=1)
+                else:
+                    # No batch dim - stack along dim=0
+                    stacked[self.state_key] = torch.cat(states, dim=0)
+            else:
+                # Numpy array
+                if states[0].ndim == 2:
+                    stacked[self.state_key] = np.concatenate(states, axis=1)
+                else:
+                    stacked[self.state_key] = np.concatenate(states, axis=0)
         else:
             stacked[self.state_key] = states[-1]  # Fallback
+
         # Copy any other keys unchanged
         for key, value in obs.items():
             if key not in stacked:
