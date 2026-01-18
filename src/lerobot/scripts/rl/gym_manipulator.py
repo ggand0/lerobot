@@ -1142,6 +1142,12 @@ class ResetWrapper(gym.Wrapper):
 
             # IK reset complete
             logging.info("IK reset complete")
+
+            # Disable leader torque so user can teleoperate freely
+            if hasattr(self.env, "robot_leader"):
+                self.env.robot_leader.bus.sync_write("Torque_Enable", 0)
+                logging.info("Leader torque disabled for teleoperation")
+
             log_say("Episode starting", play_sounds=True)
 
             # Wait for user to reposition objects if delay configured
@@ -1632,13 +1638,18 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         self._init_keyboard_events()
         self.event_lock = Lock()  # Thread-safe access to events
 
-        # Initialize robot control
+        # Initialize robot control - support both URDF and MuJoCo-based robots
         self.kinematics = None
+        self.use_mujoco_fk = False
+
         if hasattr(env.unwrapped.robot.config, 'urdf_path') and hasattr(env.unwrapped.robot.config, 'target_frame_name'):
             self.kinematics = RobotKinematics(
                 urdf_path=env.unwrapped.robot.config.urdf_path,
                 target_frame_name=env.unwrapped.robot.config.target_frame_name,
             )
+        elif hasattr(env.unwrapped.robot, 'mj_data'):
+            # MuJoCo-based robot (like SO101FollowerEndEffector)
+            self.use_mujoco_fk = True
         self.leader_torque_enabled = True
         self.prev_leader_gripper = None
 
@@ -1802,6 +1813,44 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             action = np.clip(leader_ee - follower_ee, -self.end_effector_step_sizes, self.end_effector_step_sizes)
             # Normalize the action to the range [-1, 1]
             action = action / self.end_effector_step_sizes
+        elif self.use_mujoco_fk:
+            # MuJoCo-based FK for SO101FollowerEndEffector and similar robots
+            import mujoco
+            robot = self.unwrapped.robot
+            mj_model = robot.mj_model
+            mj_data = robot.mj_data
+            ee_site_id = robot.ee_site_id
+
+            # Number of DOF (exclude gripper for FK)
+            num_dof = min(len(leader_pos) - 1, mj_model.nq) if len(leader_pos) > 1 else mj_model.nq
+
+            # Save original qpos to restore after FK computation
+            original_qpos = mj_data.qpos.copy()
+
+            # Compute leader EE position via FK
+            # Convert degrees to radians for MuJoCo
+            leader_joints_rad = np.deg2rad(leader_pos[:num_dof])
+            mj_data.qpos[:num_dof] = leader_joints_rad
+            mujoco.mj_forward(mj_model, mj_data)
+            leader_ee = mj_data.site_xpos[ee_site_id].copy()
+
+            # Compute follower EE position via FK
+            follower_joints_rad = np.deg2rad(follower_pos[:num_dof])
+            mj_data.qpos[:num_dof] = follower_joints_rad
+            mujoco.mj_forward(mj_model, mj_data)
+            follower_ee = mj_data.site_xpos[ee_site_id].copy()
+
+            # Restore original qpos so robot's internal state isn't corrupted
+            mj_data.qpos[:] = original_qpos
+            mujoco.mj_forward(mj_model, mj_data)
+
+            # Store leader positions for direct joint mirroring (for responsive teleoperation)
+            # This ensures the follower mirrors the leader's joints immediately
+            self.unwrapped._leader_positions = {name: leader_pos_dict[name] for name in leader_pos_dict}
+
+            # Compute delta and normalize for the EE action (stored in buffer for learning)
+            action = np.clip(leader_ee - follower_ee, -self.end_effector_step_sizes, self.end_effector_step_sizes)
+            action = action / self.end_effector_step_sizes
         else:
             # Fallback: when no kinematics available, store leader positions for later use
             # Store leader positions on the environment for the RobotEnv to use
@@ -1947,6 +1996,17 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
     of human intervention mode with keyboard controls.
     """
 
+    def __init__(
+        self,
+        env,
+        teleop_device,
+        end_effector_step_sizes,
+        use_gripper=False,
+        start_with_intervention=False,
+    ):
+        self._start_with_intervention = start_with_intervention
+        super().__init__(env, teleop_device, end_effector_step_sizes, use_gripper=use_gripper)
+
     def _init_keyboard_events(self):
         """
         Initialize keyboard events including human intervention flag.
@@ -1955,7 +2015,17 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
         intervention state toggled by keyboard.
         """
         super()._init_keyboard_events()
-        self.keyboard_events["human_intervention_step"] = False
+        self.keyboard_events["human_intervention_step"] = getattr(self, '_start_with_intervention', False)
+
+    def reset(self, **kwargs):
+        """Reset and restore intervention state if start_with_intervention is set."""
+        result = super().reset(**kwargs)
+        if self._start_with_intervention:
+            self.keyboard_events["human_intervention_step"] = True
+            logging.info("Intervention enabled by default (record mode) - leader controls follower")
+        else:
+            logging.info("Intervention OFF - press 'i' to enable leader control")
+        return result
 
     def _handle_key_press(self, key, keyboard_device):
         """
@@ -2509,11 +2579,13 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
             "y": 0.02,
             "z": 0.02,
         })
+        start_with_intervention = cfg.mode == "record"
         env = GearedLeaderControlWrapper(
             env=env,
             teleop_device=teleop_device,
             end_effector_step_sizes=end_effector_step_sizes,
             use_gripper=cfg.wrapper.use_gripper,
+            start_with_intervention=start_with_intervention,
         )
     elif control_mode == "leader_automatic":
         end_effector_step_sizes = getattr(cfg.robot, 'end_effector_step_sizes', {
@@ -2662,7 +2734,8 @@ def record_dataset(env, policy, cfg):
     while episode_index < cfg.num_episodes:
         obs, _ = env.reset()
         start_episode_t = time.perf_counter()
-        log_say(f"Recording episode {episode_index}", play_sounds=False)
+        log_say(f"Recording episode {episode_index}", play_sounds=True)
+        logging.info(f"Recording episode {episode_index}")
 
         # Track success state collection
         success_detected = False
@@ -2730,6 +2803,9 @@ def record_dataset(env, policy, cfg):
                 # We've collected enough success states
                 logging.info(f"Collected {success_steps_collected} additional success states")
                 break
+
+        log_say("Episode ended", play_sounds=True)
+        logging.info("Episode ended")
 
         # Handle episode recording
         if info.get("rerecord_episode", False):
@@ -2804,6 +2880,7 @@ def main(cfg: EnvConfig):
             policy=policy,
             cfg=cfg,
         )
+        env.close()
         exit()
 
     if cfg.mode == "replay":
@@ -2811,6 +2888,7 @@ def main(cfg: EnvConfig):
             env,
             cfg=cfg,
         )
+        env.close()
         exit()
 
     env.reset()
