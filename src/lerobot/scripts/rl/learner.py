@@ -1114,17 +1114,25 @@ def initialize_replay_buffer(
         repo_id = None
         if cfg.dataset is not None:
             repo_id = cfg.dataset.repo_id
-        dataset = LeRobotDataset(
-            repo_id=repo_id,
-            root=dataset_path,
-        )
-        return ReplayBuffer.from_lerobot_dataset(
-            lerobot_dataset=dataset,
-            capacity=cfg.policy.online_buffer_capacity,
-            device=device,
-            state_keys=cfg.policy.input_features.keys(),
-            optimize_memory=True,
-        )
+        try:
+            dataset = LeRobotDataset(
+                repo_id=repo_id,
+                root=dataset_path,
+            )
+            return ReplayBuffer.from_lerobot_dataset(
+                lerobot_dataset=dataset,
+                capacity=cfg.policy.online_buffer_capacity,
+                device=device,
+                state_keys=cfg.policy.input_features.keys(),
+                optimize_memory=True,
+            )
+        except ValueError as e:
+            # Frame stacking creates 9-channel images that LeRobotDataset validation rejects
+            if "Shape of" in str(e):
+                logging.warning(f"[LEARNER] Cannot load saved online dataset (frame stacking incompatible): {e}")
+                logging.warning("[LEARNER] Starting with empty online buffer, policy weights will still be loaded")
+            else:
+                raise
 
     # Start with empty buffer (either fresh start or resume without saved dataset)
     if cfg.resume:
