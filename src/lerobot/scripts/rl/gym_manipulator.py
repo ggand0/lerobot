@@ -1479,7 +1479,7 @@ class FullProprioceptionWrapper(gym.ObservationWrapper):
     when training DrQ-v2 with the corrected 54-dim state (18 dims × 3 frame stack).
     """
 
-    def __init__(self, env, fps=30, num_dof=6):
+    def __init__(self, env, fps=30, num_dof=6, use_radians=False):
         """
         Initialize the full proprioception wrapper.
 
@@ -1487,12 +1487,15 @@ class FullProprioceptionWrapper(gym.ObservationWrapper):
             env: The environment to wrap.
             fps: Frames per second used to calculate velocity.
             num_dof: Number of degrees of freedom (joints) in the robot.
+            use_radians: If True, convert joint positions/velocities from degrees to radians.
+                        Required for RoboBase/Genesis pretrained checkpoints which expect radians.
         """
         super().__init__(env)
 
         self.num_dof = num_dof
         self.dt = 1.0 / fps
         self.last_joint_positions = np.zeros(num_dof)
+        self.use_radians = use_radians
 
         # Full proprioceptive state: joint_pos(6) + joint_vel(6) + ee_xyz(3) + ee_euler(3) = 18
         state_dim = num_dof + num_dof + 3 + 3  # 18
@@ -1555,6 +1558,11 @@ class FullProprioceptionWrapper(gym.ObservationWrapper):
         # Compute joint velocities (6 dims)
         joint_vel = (joint_pos - self.last_joint_positions) / self.dt
         self.last_joint_positions = joint_pos.copy()
+
+        # Convert to radians if requested (required for RoboBase/Genesis pretrained models)
+        if self.use_radians:
+            joint_pos = np.radians(joint_pos)
+            joint_vel = np.radians(joint_vel)  # deg/s -> rad/s
 
         # Get end-effector pose via FK
         if self.use_mujoco_fk:
@@ -2516,7 +2524,8 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
         # Full proprioception mode provides 18-dim state for DrQ-v2:
         # joint_pos(6) + joint_vel(6) + ee_xyz(3) + ee_euler(3)
         if getattr(cfg.wrapper, 'add_full_proprioception', False):
-            env = FullProprioceptionWrapper(env=env, fps=cfg.fps)
+            use_radians = getattr(cfg.wrapper, 'use_radians', False)
+            env = FullProprioceptionWrapper(env=env, fps=cfg.fps, use_radians=use_radians)
         else:
             # Legacy mode: individual wrappers
             if cfg.wrapper.add_joint_velocity_to_observation:

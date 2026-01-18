@@ -34,6 +34,7 @@ from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
 
 from lerobot.policies.pretrained import PreTrainedPolicy
+from lerobot.policies.normalize import Normalize, Unnormalize
 from .configuration_drqv2 import DrQV2Config
 
 
@@ -517,6 +518,16 @@ class DrQV2Policy(PreTrainedPolicy):
         # Training state
         self._step = 0
 
+        # Input/output normalization (critical for proper policy behavior)
+        # Uses dataset_stats from config if not provided as argument
+        stats = dataset_stats if dataset_stats is not None else config.dataset_stats
+        self.normalize_inputs = Normalize(
+            config.input_features, config.normalization_mapping, stats
+        )
+        self.unnormalize_outputs = Unnormalize(
+            config.output_features, config.normalization_mapping, stats
+        )
+
         # Compatibility aliases for learner.py
         self.critic_ensemble = self.critic  # learner.py expects critic_ensemble
         # Dummy log_alpha for temperature (DrQ-v2 doesn't use it, but learner expects it)
@@ -668,6 +679,9 @@ class DrQV2Policy(PreTrainedPolicy):
         std = self.get_std(step)
 
         with torch.no_grad():
+            # Normalize inputs (critical for proper policy behavior)
+            batch = self.normalize_inputs(batch)
+
             # Extract observations
             low_dim_obs = None
             if "observation.state" in batch:
@@ -770,6 +784,10 @@ class DrQV2Policy(PreTrainedPolicy):
         next_observations = batch["next_state"]
         done = batch["done"]
 
+        # Normalize observations (critical for proper policy behavior)
+        observations = self.normalize_inputs(observations)
+        next_observations = self.normalize_inputs(next_observations)
+
         # Ensure proper shapes
         if rewards.dim() == 1:
             rewards = rewards.unsqueeze(1)
@@ -849,6 +867,9 @@ class DrQV2Policy(PreTrainedPolicy):
         """
         observations = batch["state"]
         step = self._step
+
+        # Normalize observations (critical for proper policy behavior)
+        observations = self.normalize_inputs(observations)
 
         # Extract observations
         low_dim_obs = None

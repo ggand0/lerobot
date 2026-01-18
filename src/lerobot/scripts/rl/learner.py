@@ -1196,12 +1196,14 @@ def initialize_offline_replay_buffer(
 
     # Get full proprioception config
     compute_full_proprioception = False
+    convert_to_radians = False
     mujoco_model_path = None
     ee_site_name = "gripper"
     fps = 30.0
 
     if hasattr(cfg, "env") and hasattr(cfg.env, "wrapper"):
         compute_full_proprioception = getattr(cfg.env.wrapper, "add_full_proprioception", False)
+        convert_to_radians = getattr(cfg.env.wrapper, "use_radians", False)
 
     # Get MuJoCo model path from robot config (needed for full proprioception and action conversion)
     if hasattr(cfg, "env") and hasattr(cfg.env, "robot"):
@@ -1221,6 +1223,8 @@ def initialize_offline_replay_buffer(
 
     if compute_full_proprioception:
         logging.info(f"Computing full proprioception with MuJoCo FK (model: {mujoco_model_path}, site: {ee_site_name})")
+        if convert_to_radians:
+            logging.info("Converting joint positions/velocities to radians (for RoboBase/Genesis pretrained models)")
 
     # Check if action conversion is needed (dataset has joint actions but policy expects EE actions)
     convert_actions_to_ee = False
@@ -1289,6 +1293,7 @@ def initialize_offline_replay_buffer(
         capacity=cfg.policy.offline_buffer_capacity,
         image_size=image_size,
         compute_full_proprioception=compute_full_proprioception,
+        convert_to_radians=convert_to_radians,
         mujoco_model_path=mujoco_model_path,
         ee_site_name=ee_site_name,
         fps=fps,

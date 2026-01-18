@@ -60,13 +60,14 @@ class DrQV2Config(PreTrainedConfig):
     loading pre-trained checkpoints from simulation.
     """
 
-    # Normalization (DrQ-v2 uses simple x/255 - 0.5, not ImageNet stats)
+    # Normalization - RoboBase uses IDENTITY (no normalization) for low_dim_state
+    # The pretrained actor expects raw values in radians, not normalized values
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,  # Handled in encoder
-            "STATE": NormalizationMode.MIN_MAX,
-            "ENV": NormalizationMode.MIN_MAX,
-            "ACTION": NormalizationMode.MIN_MAX,
+            "STATE": NormalizationMode.IDENTITY,   # RoboBase uses no normalization
+            "ENV": NormalizationMode.IDENTITY,
+            "ACTION": NormalizationMode.IDENTITY,  # Actions already in [-1, 1]
         }
     )
 
@@ -145,6 +146,10 @@ class DrQV2Config(PreTrainedConfig):
 
     # Pretrained model path (used when loading from checkpoint)
     pretrained_path: str | None = None
+
+    # Skip loading pretrained critic weights (for sim-to-real transfer)
+    # When True, only loads actor and encoder weights, training critic from scratch
+    skip_pretrained_critic: bool = False
 
     # Actor-learner config for distributed training (HIL-SERL)
     actor_learner_config: ActorLearnerConfig = field(default_factory=ActorLearnerConfig)
