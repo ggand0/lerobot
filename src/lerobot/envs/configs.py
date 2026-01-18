@@ -180,6 +180,7 @@ class EnvTransformConfig:
     add_current_to_observation: bool = False
     add_ee_pose_to_observation: bool = False
     add_full_proprioception: bool = False  # 18-dim state: joint_pos + joint_vel + ee_xyz + ee_euler
+    use_radians: bool = False  # Convert joint positions/velocities to radians (for RoboBase/Genesis compatibility)
     crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None
     resize_size: tuple[int, int] | None = None
     control_time_s: float = 20.0
