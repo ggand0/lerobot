@@ -27,11 +27,16 @@ from lerobot.envs.configs import EnvConfig
 from lerobot.utils.utils import get_channel_first_image_shape
 
 
-def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Tensor]:
+def preprocess_observation(
+    observations: dict[str, np.ndarray],
+    normalize_images: bool = True,
+) -> dict[str, Tensor]:
     # TODO(aliberts, rcadene): refactor this to use features from the environment (no hardcoding)
     """Convert environment observation to LeRobot format observation.
     Args:
         observation: Dictionary of observation batches from a Gym vector environment.
+        normalize_images: If True, normalize images to [0, 1]. If False, keep as float32 [0, 255].
+            Set to False when using encoders that do their own normalization (e.g., DrQ-v2).
     Returns:
         Dictionary of observation batches with keys renamed to LeRobot format and values as tensors.
     """
@@ -58,10 +63,12 @@ def preprocess_observation(observations: dict[str, np.ndarray]) -> dict[str, Ten
             # sanity check that images are uint8
             assert img.dtype == torch.uint8, f"expect torch.uint8, but instead {img.dtype=}"
 
-            # convert to channel first of type float32 in range [0,1]
+            # convert to channel first of type float32
             img = einops.rearrange(img, "b h w c -> b c h w").contiguous()
             img = img.type(torch.float32)
-            img /= 255
+            if normalize_images:
+                img /= 255  # normalize to [0, 1]
+            # else: keep as [0, 255] for encoders with normalise_inputs=True
 
             return_observations[imgkey] = img
 

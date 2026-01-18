@@ -447,6 +447,7 @@ class ReplayBuffer:
         ee_action_scale: float = 0.02,
         target_action_dim: int | None = None,
         frame_stack: int = 1,
+        unnormalize_images: bool = False,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -475,6 +476,8 @@ class ReplayBuffer:
             ee_action_scale (float): Scale for EE delta actions (to denormalize).
             target_action_dim (int | None): Target action dimension (e.g., 4 for xyz+gripper).
             frame_stack (int): Number of frames to stack for observations. Default 1 (no stacking).
+            unnormalize_images (bool): If True, convert images from [0, 1] to [0, 255] range.
+                Required when using encoders that do their own normalization (e.g., DrQ-v2 with normalise_inputs=True).
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
@@ -616,6 +619,10 @@ class ReplayBuffer:
                     val = F.interpolate(
                         val.unsqueeze(0), size=image_size, mode="bilinear", align_corners=False
                     ).squeeze(0)
+
+                # Unnormalize images from [0, 1] to [0, 255] for encoders with normalise_inputs=True
+                if unnormalize_images and ".images." in key and val.ndim == 3:
+                    val = val * 255.0
 
                 # Compute full proprioception for observation.state
                 if compute_full_proprioception and key == "observation.state" and mj_model is not None:

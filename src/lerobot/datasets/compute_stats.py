@@ -91,17 +91,31 @@ def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], featu
             ep_ft_array = sample_images(data)  # data is a list of image paths
             axes_to_reduce = (0, 2, 3)  # keep channel dim
             keepdims = True
+            is_image_from_paths = True
+        elif "image" in key and isinstance(data, np.ndarray) and data.ndim == 4:
+            # Handle pre-processed image arrays (e.g., frame-stacked images from replay buffer)
+            # Shape is (N, C, H, W) - reduce over batch and spatial dims, keep channel dim
+            ep_ft_array = data
+            axes_to_reduce = (0, 2, 3)  # keep channel dim
+            keepdims = True
+            is_image_from_paths = False
         else:
             ep_ft_array = data  # data is already a np.ndarray
             axes_to_reduce = 0  # compute stats over the first axis
             keepdims = data.ndim == 1  # keep as np.array
+            is_image_from_paths = False
 
         ep_stats[key] = get_feature_stats(ep_ft_array, axis=axes_to_reduce, keepdims=keepdims)
 
-        # finally, we normalize and remove batch dim for images
+        # Normalize and remove batch dim for images loaded from paths (uint8 0-255 range)
         if features[key]["dtype"] in ["image", "video"]:
             ep_stats[key] = {
                 k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
+            }
+        # For pre-processed image arrays, just remove the batch dim (already normalized)
+        elif "image" in key and isinstance(data, np.ndarray) and data.ndim == 4:
+            ep_stats[key] = {
+                k: v if k == "count" else np.squeeze(v, axis=0) for k, v in ep_stats[key].items()
             }
 
     return ep_stats
