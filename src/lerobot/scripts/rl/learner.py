@@ -72,6 +72,7 @@ from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_policy
 from lerobot.policies.sac.modeling_sac import SACPolicy
+from lerobot.policies.drqv2.modeling_drqv2 import DrQV2Policy
 from lerobot.robots import so100_follower, so101_follower  # noqa: F401
 from lerobot.scripts.rl import learner_service
 from lerobot.teleoperators import gamepad, so101_leader  # noqa: F401
@@ -309,6 +310,9 @@ def add_actor_information_and_train(
     online_steps = cfg.policy.online_steps
     async_prefetch = cfg.policy.async_prefetch
 
+    # Log checkpoint config at startup
+    logging.info(f"[LEARNER] Checkpoint config: save_checkpoint={saving_checkpoint}, save_freq={save_freq}, output_dir={cfg.output_dir}")
+
     # Initialize logging for multiprocessing
     if not use_threads(cfg):
         log_dir = os.path.join(cfg.output_dir, "logs")
@@ -455,11 +459,20 @@ def add_actor_information_and_train(
             # Main critic optimization
             loss_critic = critic_output["loss_critic"]
             optimizers["critic"].zero_grad()
+            # For DrQ-v2, also zero encoder gradients (encoder trained through critic loss)
+            if "encoder" in optimizers:
+                optimizers["encoder"].zero_grad()
             loss_critic.backward()
             critic_grad_norm = torch.nn.utils.clip_grad_norm_(
                 parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
             )
             optimizers["critic"].step()
+            # For DrQ-v2, step encoder optimizer after critic
+            if "encoder" in optimizers:
+                torch.nn.utils.clip_grad_norm_(
+                    parameters=policy.encoder.parameters(), max_norm=clip_grad_norm_value
+                )
+                optimizers["encoder"].step()
 
             # Discrete critic optimization (if available)
             if policy.config.num_discrete_actions is not None:
@@ -511,17 +524,29 @@ def add_actor_information_and_train(
 
         loss_critic = critic_output["loss_critic"]
         optimizers["critic"].zero_grad()
+        # For DrQ-v2, also zero encoder gradients (encoder trained through critic loss)
+        if "encoder" in optimizers:
+            optimizers["encoder"].zero_grad()
         loss_critic.backward()
         critic_grad_norm = torch.nn.utils.clip_grad_norm_(
             parameters=policy.critic_ensemble.parameters(), max_norm=clip_grad_norm_value
         ).item()
         optimizers["critic"].step()
+        # For DrQ-v2, step encoder optimizer after critic
+        if "encoder" in optimizers:
+            encoder_grad_norm = torch.nn.utils.clip_grad_norm_(
+                parameters=policy.encoder.parameters(), max_norm=clip_grad_norm_value
+            ).item()
+            optimizers["encoder"].step()
 
         # Initialize training info dictionary
         training_infos = {
             "loss_critic": loss_critic.item(),
             "critic_grad_norm": critic_grad_norm,
         }
+        # Add encoder grad norm for DrQ-v2
+        if "encoder" in optimizers:
+            training_infos["encoder_grad_norm"] = encoder_grad_norm
 
         # Discrete critic optimization (if available)
         if policy.config.num_discrete_actions is not None:
@@ -588,15 +613,26 @@ def add_actor_information_and_train(
                 training_infos["offline_replay_buffer_size"] = len(offline_replay_buffer)
             training_infos["Optimization step"] = optimization_step
 
-            # Log training metrics
+            # Log training metrics to console
+            loss_str = f"critic={training_infos.get('loss_critic', 0):.4f}"
+            if "loss_actor" in training_infos:
+                loss_str += f" actor={training_infos['loss_actor']:.4f}"
+            if "loss_temperature" in training_infos:
+                loss_str += f" temp={training_infos['loss_temperature']:.4f}"
+            if "temperature" in training_infos:
+                loss_str += f" α={training_infos['temperature']:.4f}"
+            logging.info(
+                f"[LEARNER] Step {optimization_step}: {loss_str} "
+                f"buffer={training_infos['replay_buffer_size']}"
+            )
+
+            # Log training metrics to wandb
             if wandb_logger:
                 wandb_logger.log_dict(d=training_infos, mode="train", custom_step_key="Optimization step")
 
-        # Calculate and log optimization frequency
+        # Calculate optimization frequency (only log periodically to reduce spam)
         time_for_one_optimization_step = time.time() - time_for_one_optimization_step
         frequency_for_one_optimization_step = 1 / (time_for_one_optimization_step + 1e-9)
-
-        logging.info(f"[LEARNER] Optimization frequency loop [Hz]: {frequency_for_one_optimization_step}")
 
         # Log optimization frequency
         if wandb_logger:
@@ -614,19 +650,28 @@ def add_actor_information_and_train(
             logging.info(f"[LEARNER] Number of optimization step: {optimization_step}")
 
         # Save checkpoint at specified intervals
-        if saving_checkpoint and (optimization_step % save_freq == 0 or optimization_step == online_steps):
-            save_training_checkpoint(
-                cfg=cfg,
-                optimization_step=optimization_step,
-                online_steps=online_steps,
-                interaction_message=interaction_message,
-                policy=policy,
-                optimizers=optimizers,
-                replay_buffer=replay_buffer,
-                offline_replay_buffer=offline_replay_buffer,
-                dataset_repo_id=dataset_repo_id,
-                fps=fps,
-            )
+        should_save = optimization_step % save_freq == 0 or optimization_step == online_steps
+        if should_save:
+            logging.info(f"[LEARNER] Checkpoint check: step={optimization_step}, save_freq={save_freq}, saving_checkpoint={saving_checkpoint}")
+            if saving_checkpoint:
+                try:
+                    save_training_checkpoint(
+                        cfg=cfg,
+                        optimization_step=optimization_step,
+                        online_steps=online_steps,
+                        interaction_message=interaction_message,
+                        policy=policy,
+                        optimizers=optimizers,
+                        replay_buffer=replay_buffer,
+                        offline_replay_buffer=offline_replay_buffer,
+                        dataset_repo_id=dataset_repo_id,
+                        fps=fps,
+                    )
+                    logging.info(f"[LEARNER] Checkpoint saved at step {optimization_step}")
+                except Exception as e:
+                    logging.error(f"[LEARNER] Failed to save checkpoint at step {optimization_step}: {e}")
+                    import traceback
+                    logging.error(traceback.format_exc())
 
 
 def start_learner(
@@ -794,12 +839,14 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
     - The **actor network**, ensuring that only relevant parameters are optimized.
     - The **critic ensemble**, which evaluates the value function.
     - The **temperature parameter**, which controls the entropy in soft actor-critic (SAC)-like methods.
+    - For DrQ-v2: The **encoder**, which is trained through the critic loss.
 
     It also initializes a learning rate scheduler, though currently, it is set to `None`.
 
     NOTE:
     - If the encoder is shared, its parameters are excluded from the actor's optimization process.
     - The policy's log temperature (`log_alpha`) is wrapped in a list to ensure proper optimization as a standalone tensor.
+    - For DrQ-v2, the encoder has a separate optimizer since it's trained through the critic loss.
 
     Args:
         cfg: Configuration object containing hyperparameters.
@@ -808,10 +855,13 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
     Returns:
         Tuple[Dict[str, torch.optim.Optimizer], Optional[torch.optim.lr_scheduler._LRScheduler]]:
         A tuple containing:
-        - `optimizers`: A dictionary mapping component names ("actor", "critic", "temperature") to their respective Adam optimizers.
+        - `optimizers`: A dictionary mapping component names ("actor", "critic", "temperature", optionally "encoder") to their respective Adam optimizers.
         - `lr_scheduler`: Currently set to `None` but can be extended to support learning rate scheduling.
 
     """
+    # Check if this is a DrQ-v2 policy (has encoder that needs separate optimization)
+    is_drqv2 = isinstance(policy, DrQV2Policy)
+
     optimizer_actor = torch.optim.Adam(
         params=[
             p
@@ -835,6 +885,13 @@ def make_optimizers_and_scheduler(cfg: TrainRLServerPipelineConfig, policy: nn.M
     }
     if cfg.policy.num_discrete_actions is not None:
         optimizers["discrete_critic"] = optimizer_discrete_critic
+
+    # For DrQ-v2, add encoder optimizer (encoder is trained through critic loss)
+    if is_drqv2:
+        encoder_lr = getattr(cfg.policy, "encoder_lr", cfg.policy.critic_lr)
+        optimizers["encoder"] = torch.optim.Adam(params=policy.encoder.parameters(), lr=encoder_lr)
+        logging.info(f"[LEARNER] DrQ-v2 detected: added encoder optimizer with lr={encoder_lr}")
+
     return optimizers, lr_scheduler
 
 
@@ -903,6 +960,12 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     # Load config using Draccus
     checkpoint_cfg_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR, "train_config.json")
     checkpoint_cfg = TrainRLServerPipelineConfig.from_pretrained(checkpoint_cfg_path)
+
+    # Preserve certain config values from the current config (not checkpoint)
+    # This allows changing save_freq, log_freq, etc. without recreating checkpoints
+    checkpoint_cfg.save_freq = cfg.save_freq
+    checkpoint_cfg.log_freq = cfg.log_freq
+    checkpoint_cfg.save_checkpoint = cfg.save_checkpoint
 
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True

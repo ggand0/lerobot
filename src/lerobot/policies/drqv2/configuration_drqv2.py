@@ -117,6 +117,7 @@ class DrQV2Config(PreTrainedConfig):
     vision_encoder_name: str | None = None  # DrQ-v2 uses custom encoder
     freeze_vision_encoder: bool = False  # DrQ-v2 trains the encoder
     grad_clip_norm: float = 1.0  # Gradient clipping
+    utd_ratio: int = 1  # Update-to-data ratio (critic updates per env step)
 
     # Pretrained model path (used when loading from checkpoint)
     pretrained_path: str | None = None
