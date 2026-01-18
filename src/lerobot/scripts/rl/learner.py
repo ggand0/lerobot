@@ -330,6 +330,33 @@ def add_actor_information_and_train(
 
     assert isinstance(policy, nn.Module)
 
+    # Load pretrained weights if specified (e.g., Genesis DrQ-v2 checkpoint)
+    # Check config object first, then fall back to reading from saved JSON config
+    pretrained_path = getattr(cfg.policy, "pretrained_path", None)
+    if pretrained_path is None:
+        # Config parser may not preserve pretrained_path, read from saved JSON
+        config_json_path = os.path.join(cfg.output_dir, "train_config.json")
+        if os.path.exists(config_json_path):
+            import json
+            with open(config_json_path) as f:
+                saved_cfg = json.load(f)
+            pretrained_path = saved_cfg.get("policy", {}).get("pretrained_path")
+
+    if pretrained_path:
+        logging.info(f"[LEARNER] Loading pretrained weights from {pretrained_path}")
+        checkpoint = torch.load(pretrained_path, map_location=device, weights_only=False)
+        if "agent" in checkpoint:
+            # RoboBase/Genesis format
+            if hasattr(policy, "_load_robobase_weights"):
+                policy._load_robobase_weights(checkpoint["agent"])
+                logging.info("[LEARNER] Loaded RoboBase pretrained weights")
+            else:
+                logging.warning("[LEARNER] Policy does not support RoboBase weight loading")
+        else:
+            # Direct state dict format
+            policy.load_state_dict(checkpoint, strict=False)
+            logging.info("[LEARNER] Loaded pretrained state dict")
+
     policy.train()
 
     push_actor_policy_to_queue(parameters_queue=parameters_queue, policy=policy)

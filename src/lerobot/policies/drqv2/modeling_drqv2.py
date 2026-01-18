@@ -1207,8 +1207,11 @@ class DrQV2Policy(PreTrainedPolicy):
         """Load weights from RoboBase state dict.
 
         Maps RoboBase key names to LeRobot key names.
+        Skips weights with shape mismatches (e.g., different frame_stack or state_dim).
         """
         new_state_dict = {}
+        skipped = []
+        model_state = self.state_dict()
 
         for key, value in state_dict.items():
             # Skip hidden states (RNN buffers)
@@ -1217,14 +1220,31 @@ class DrQV2Policy(PreTrainedPolicy):
 
             new_key = self._map_robobase_key(key)
             if new_key is not None:
-                new_state_dict[new_key] = value
+                # Check if shape matches the model
+                if new_key in model_state:
+                    if model_state[new_key].shape == value.shape:
+                        new_state_dict[new_key] = value
+                    else:
+                        skipped.append(f"{new_key}: checkpoint {value.shape} vs model {model_state[new_key].shape}")
+                else:
+                    # Key doesn't exist in model, skip
+                    skipped.append(f"{new_key}: not in model")
+
+        if skipped:
+            print(f"Skipped {len(skipped)} weights due to shape mismatch:")
+            for s in skipped[:10]:  # Show first 10
+                print(f"  - {s}")
+            if len(skipped) > 10:
+                print(f"  ... and {len(skipped) - 10} more")
 
         # Load with strict=False to allow missing keys
         missing, unexpected = self.load_state_dict(new_state_dict, strict=False)
         if missing:
-            print(f"Missing keys: {missing}")
+            print(f"Missing keys (will use random init): {len(missing)} keys")
         if unexpected:
             print(f"Unexpected keys: {unexpected}")
+
+        print(f"Successfully loaded {len(new_state_dict)} weights from RoboBase checkpoint")
 
     def _map_robobase_key(self, key: str) -> str | None:
         """Map RoboBase key to LeRobot key."""
