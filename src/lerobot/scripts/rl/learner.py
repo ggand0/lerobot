@@ -1340,6 +1340,13 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
     # Create a dictionary to hold all the state dicts
     state_dicts = {"policy": move_state_dict_to_device(policy.actor.state_dict(), device="cpu")}
 
+    # Add encoder if it exists (needed for DrQ-v2 which trains encoder end-to-end)
+    if hasattr(policy, "encoder") and policy.encoder is not None:
+        state_dicts["encoder"] = move_state_dict_to_device(
+            policy.encoder.state_dict(), device="cpu"
+        )
+        logging.debug("[LEARNER] Including encoder in state dict push")
+
     # Add discrete critic if it exists
     if hasattr(policy, "discrete_critic") and policy.discrete_critic is not None:
         state_dicts["discrete_critic"] = move_state_dict_to_device(
