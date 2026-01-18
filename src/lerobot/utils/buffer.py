@@ -445,6 +445,7 @@ class ReplayBuffer:
         convert_actions_to_ee: bool = False,
         ee_action_scale: float = 0.02,
         target_action_dim: int | None = None,
+        frame_stack: int = 1,
     ) -> "ReplayBuffer":
         """
         Convert a LeRobotDataset into a ReplayBuffer.
@@ -470,6 +471,7 @@ class ReplayBuffer:
             convert_actions_to_ee (bool): If True, convert joint actions to EE delta actions.
             ee_action_scale (float): Scale for EE delta actions (to denormalize).
             target_action_dim (int | None): Target action dimension (e.g., 4 for xyz+gripper).
+            frame_stack (int): Number of frames to stack for observations. Default 1 (no stacking).
 
         Returns:
             ReplayBuffer: The replay buffer with dataset transitions.
@@ -535,11 +537,67 @@ class ReplayBuffer:
         if not has_reward_key:
             print("'next.reward' key not found in dataset. Using 0.0 as default reward...")
 
+        # Frame stacking setup
+        use_frame_stacking = frame_stack > 1
+        if use_frame_stacking:
+            from collections import deque as frame_deque
+            # Identify image keys and state keys for stacking
+            image_keys_to_stack = [k for k in state_keys if ".images." in k]
+            state_key = "observation.state" if "observation.state" in state_keys else None
+            # Initialize frame buffers (will be reset per episode)
+            frame_buffers: dict[str, deque] = {}
+            print(f"Frame stacking enabled: {frame_stack} frames")
+            print(f"  Image keys to stack: {image_keys_to_stack}")
+            print(f"  State key to stack: {state_key}")
+
+        def reset_frame_buffers(initial_state: dict[str, torch.Tensor]) -> None:
+            """Reset frame buffers with copies of initial state."""
+            if not use_frame_stacking:
+                return
+            for key in image_keys_to_stack:
+                frame_buffers[key] = frame_deque(maxlen=frame_stack)
+                for _ in range(frame_stack):
+                    frame_buffers[key].append(initial_state[key].clone())
+            if state_key and state_key in initial_state:
+                frame_buffers[state_key] = frame_deque(maxlen=frame_stack)
+                for _ in range(frame_stack):
+                    frame_buffers[state_key].append(initial_state[state_key].clone())
+
+        def update_frame_buffers(current_state: dict[str, torch.Tensor]) -> None:
+            """Add current state to frame buffers."""
+            if not use_frame_stacking:
+                return
+            for key in image_keys_to_stack:
+                if key in current_state:
+                    frame_buffers[key].append(current_state[key].clone())
+            if state_key and state_key in current_state:
+                frame_buffers[state_key].append(current_state[state_key].clone())
+
+        def get_stacked_state(raw_state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            """Get frame-stacked version of state."""
+            if not use_frame_stacking:
+                return raw_state
+            stacked = {}
+            for key, val in raw_state.items():
+                if key in image_keys_to_stack and key in frame_buffers:
+                    # Stack images along channel dimension: (1, C, H, W) x N -> (1, C*N, H, W)
+                    frames = list(frame_buffers[key])
+                    stacked[key] = torch.cat(frames, dim=1)  # dim=1 is channel dim with batch
+                elif key == state_key and state_key in frame_buffers:
+                    # Stack states along feature dimension: (1, D) x N -> (1, D*N)
+                    frames = list(frame_buffers[key])
+                    stacked[key] = torch.cat(frames, dim=1)  # dim=1 is feature dim with batch
+                else:
+                    stacked[key] = val
+            return stacked
+
         # Stream through dataset - only keep current and next sample in memory
         prev_sample = None
         prev_state = None
+        prev_stacked_state = None
         prev_episode_idx = None
         prev_ee_pos = None  # For action conversion
+        episode_frame_count = 0
 
         for i in tqdm(range(num_frames), desc="Converting dataset to replay buffer"):
             current_sample = lerobot_dataset[i]
@@ -587,6 +645,21 @@ class ReplayBuffer:
 
                 current_state[key] = val.unsqueeze(0).to(storage_device)
 
+            # Handle frame stacking
+            is_new_episode = prev_episode_idx is not None and prev_episode_idx != current_episode_idx
+            if use_frame_stacking:
+                if episode_frame_count == 0 or is_new_episode:
+                    # New episode - reset buffers with current state
+                    reset_frame_buffers(current_state)
+                    episode_frame_count = 1
+                else:
+                    # Same episode - update buffers
+                    update_frame_buffers(current_state)
+                    episode_frame_count += 1
+                current_stacked_state = get_stacked_state(current_state)
+            else:
+                current_stacked_state = current_state
+
             # Process previous sample now that we have current (for next_state)
             if prev_sample is not None:
                 # Determine if previous frame was done
@@ -602,11 +675,11 @@ class ReplayBuffer:
                 else:
                     reward = 0.0
 
-                # next_state is current_state if same episode, else prev_state
+                # next_state is current_stacked_state if same episode, else prev_stacked_state
                 if done:
-                    next_state = prev_state
+                    next_stacked_state = prev_stacked_state
                 else:
-                    next_state = current_state
+                    next_stacked_state = current_stacked_state
 
                 # Get action
                 action = prev_sample["action"]
@@ -638,11 +711,20 @@ class ReplayBuffer:
                     # Clip to [-1, 1]
                     ee_delta_normalized = np.clip(ee_delta_normalized, -1.0, 1.0)
 
-                    # Gripper action: use change in gripper joint (last joint)
-                    # Normalize gripper: typical range is 0-100 degrees, map to [-1, 1]
-                    gripper_val = action[-1].item()  # Get gripper from action
-                    gripper_normalized = (gripper_val / 50.0) - 1.0  # 0->-1, 100->1
-                    gripper_normalized = np.clip(gripper_normalized, -1.0, 1.0)
+                    # Gripper action: compute from gripper joint position change
+                    # Get gripper position from observation.state (last joint, index 5)
+                    # If observation.state has 6 values, last is gripper; otherwise use action
+                    if len(prev_joints) >= 6:
+                        prev_gripper = prev_joints[5]  # Gripper joint position in degrees
+                        curr_gripper = curr_joints[5]
+                        gripper_delta = curr_gripper - prev_gripper
+                        # Normalize: typical gripper range is 0-100 degrees, delta of ~10 deg = 0.2 action
+                        gripper_action = np.clip(gripper_delta / 50.0, -1.0, 1.0)
+                    else:
+                        # Fallback: use original action's gripper value
+                        gripper_val = action[-1].item() if action.numel() > 0 else 0.0
+                        gripper_action = (gripper_val / 50.0) - 1.0
+                    gripper_normalized = np.clip(gripper_action, -1.0, 1.0)
 
                     # Construct 4-dim EE action: [dx, dy, dz, gripper]
                     ee_action = np.array([
@@ -667,9 +749,9 @@ class ReplayBuffer:
                             val = val.unsqueeze(0)
                         complementary_info[short_key] = val.to(storage_device)
 
-                # Initialize storage on first transition
+                # Initialize storage on first transition (using stacked states)
                 if not replay_buffer.initialized:
-                    init_state = {k: v.to(device) for k, v in prev_state.items()}
+                    init_state = {k: v.to(device) for k, v in prev_stacked_state.items()}
                     init_action = action.to(device)
                     init_comp_info = None
                     if complementary_info:
@@ -678,12 +760,12 @@ class ReplayBuffer:
                         state=init_state, action=init_action, complementary_info=init_comp_info
                     )
 
-                # Add transition
+                # Add transition (using stacked states)
                 replay_buffer.add(
-                    state=prev_state,
+                    state=prev_stacked_state,
                     action=action,
                     reward=reward,
-                    next_state=next_state,
+                    next_state=next_stacked_state,
                     done=done,
                     truncated=False,
                     complementary_info=complementary_info,
@@ -692,6 +774,7 @@ class ReplayBuffer:
             # Shift current to previous
             prev_sample = current_sample
             prev_state = current_state
+            prev_stacked_state = current_stacked_state
             prev_episode_idx = current_episode_idx
 
         # Handle last frame (always done)
@@ -727,9 +810,9 @@ class ReplayBuffer:
                         val = val.unsqueeze(0)
                     complementary_info[short_key] = val.to(storage_device)
 
-            # Initialize if this is the only frame
+            # Initialize if this is the only frame (using stacked state)
             if not replay_buffer.initialized:
-                init_state = {k: v.to(device) for k, v in prev_state.items()}
+                init_state = {k: v.to(device) for k, v in prev_stacked_state.items()}
                 init_action = action.to(device)
                 init_comp_info = None
                 if complementary_info:
@@ -739,10 +822,10 @@ class ReplayBuffer:
                 )
 
             replay_buffer.add(
-                state=prev_state,
+                state=prev_stacked_state,
                 action=action,
                 reward=reward,
-                next_state=prev_state,  # Last frame's next_state is itself
+                next_state=prev_stacked_state,  # Last frame's next_state is itself (stacked)
                 done=True,
                 truncated=False,
                 complementary_info=complementary_info,
