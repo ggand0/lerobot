@@ -543,15 +543,25 @@ class DrQV2Policy(PreTrainedPolicy):
 
         # Low-dim state shape
         if "observation.state" in config.input_features:
-            state_shape = config.input_features.get("observation.state", {})
-            self.low_dim_size = state_shape.get("shape", [0])[0] if isinstance(state_shape, dict) else 0
+            state_feature = config.input_features.get("observation.state")
+            # Handle both dict (JSON) and PolicyFeature (parsed config) formats
+            if hasattr(state_feature, "shape"):
+                self.low_dim_size = state_feature.shape[0]
+            elif isinstance(state_feature, dict):
+                self.low_dim_size = state_feature.get("shape", [0])[0]
+            else:
+                self.low_dim_size = 0
         else:
             self.low_dim_size = 0
 
         # Action shape
-        self.action_dim = config.output_features.get("action", {}).get("shape", [4])[0] if isinstance(
-            config.output_features.get("action", {}), dict
-        ) else 4
+        action_feature = config.output_features.get("action")
+        if hasattr(action_feature, "shape"):
+            self.action_dim = action_feature.shape[0]
+        elif isinstance(action_feature, dict):
+            self.action_dim = action_feature.get("shape", [4])[0]
+        else:
+            self.action_dim = 4
 
     def _build_encoder(self):
         """Build the CNN encoder."""
