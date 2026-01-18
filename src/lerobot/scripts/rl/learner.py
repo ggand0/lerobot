@@ -1228,13 +1228,16 @@ def initialize_offline_replay_buffer(
     dataset_action_dim = offline_dataset[0]["action"].shape[0] if len(offline_dataset) > 0 else None
 
     # Check if dataset actions are all zeros (corrupted/missing actions)
+    # Only check XYZ components (first 3), as gripper (4th) may be non-zero
     actions_are_zero = False
     if len(offline_dataset) > 0:
         import torch
         sample_actions = torch.stack([offline_dataset[i]["action"] for i in range(min(100, len(offline_dataset)))])
-        if sample_actions.abs().max() < 1e-6:
+        # Check only XYZ components (first 3 dimensions) - gripper may have valid non-zero values
+        xyz_actions = sample_actions[:, :3] if sample_actions.shape[1] >= 3 else sample_actions
+        if xyz_actions.abs().max() < 1e-6:
             actions_are_zero = True
-            logging.warning("[LEARNER] Dataset actions are all zeros - will compute from state changes")
+            logging.warning("[LEARNER] Dataset XYZ actions are all zeros - will compute from state changes")
 
     if policy_action_dim and dataset_action_dim and policy_action_dim != dataset_action_dim:
         logging.info(f"Action dimension mismatch: dataset={dataset_action_dim}, policy={policy_action_dim}")
