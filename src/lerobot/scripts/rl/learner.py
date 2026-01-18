@@ -842,19 +842,32 @@ def save_training_checkpoint(
     # Save dataset
     # NOTE: Handle the case where the dataset repo id is not specified in the config
     # eg. RL training without demonstrations data
+    # NOTE: Frame stacking produces multi-channel images that can't be saved as standard LeRobotDataset
     repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+    try:
+        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
+    except ValueError as e:
+        if "Shape of" in str(e):
+            logging.warning(f"[LEARNER] Skipping buffer-to-dataset conversion (frame stacking incompatible): {e}")
+        else:
+            raise
 
     if offline_replay_buffer is not None:
         dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
         if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
             shutil.rmtree(dataset_offline_dir)
 
-        offline_replay_buffer.to_lerobot_dataset(
-            cfg.dataset.repo_id,
-            fps=fps,
-            root=dataset_offline_dir,
-        )
+        try:
+            offline_replay_buffer.to_lerobot_dataset(
+                cfg.dataset.repo_id,
+                fps=fps,
+                root=dataset_offline_dir,
+            )
+        except ValueError as e:
+            if "Shape of" in str(e):
+                logging.warning(f"[LEARNER] Skipping offline buffer-to-dataset conversion (frame stacking incompatible): {e}")
+            else:
+                raise
 
     logging.info("Resume training")
 
@@ -1211,8 +1224,17 @@ def initialize_offline_replay_buffer(
         if policy_action_shape:
             policy_action_dim = policy_action_shape[0] if isinstance(policy_action_shape, (list, tuple)) else policy_action_shape
 
-    # Get dataset action dim
+    # Get dataset action dim and check if actions are valid
     dataset_action_dim = offline_dataset[0]["action"].shape[0] if len(offline_dataset) > 0 else None
+
+    # Check if dataset actions are all zeros (corrupted/missing actions)
+    actions_are_zero = False
+    if len(offline_dataset) > 0:
+        import torch
+        sample_actions = torch.stack([offline_dataset[i]["action"] for i in range(min(100, len(offline_dataset)))])
+        if sample_actions.abs().max() < 1e-6:
+            actions_are_zero = True
+            logging.warning("[LEARNER] Dataset actions are all zeros - will compute from state changes")
 
     if policy_action_dim and dataset_action_dim and policy_action_dim != dataset_action_dim:
         logging.info(f"Action dimension mismatch: dataset={dataset_action_dim}, policy={policy_action_dim}")
@@ -1224,6 +1246,19 @@ def initialize_offline_replay_buffer(
             if hasattr(cfg.env, "robot"):
                 ee_action_scale = getattr(cfg.env.robot, "action_scale", 0.02)
             logging.info(f"Converting joint actions to EE actions (scale: {ee_action_scale})")
+
+    # Also convert if actions are zeros (need to compute from FK)
+    if actions_are_zero and mujoco_model_path is not None:
+        convert_actions_to_ee = True
+        target_action_dim = policy_action_dim if policy_action_dim else 4
+        if hasattr(cfg.env, "robot"):
+            ee_action_scale = getattr(cfg.env.robot, "action_scale", 0.02)
+        logging.info(f"Computing actions from state changes via FK (scale: {ee_action_scale})")
+
+    # Get frame_stack from policy config (for DrQ-v2 and similar policies)
+    frame_stack = getattr(cfg.policy, "frame_stack", 1)
+    if frame_stack > 1:
+        logging.info(f"Frame stacking enabled for offline buffer: {frame_stack} frames")
 
     offline_replay_buffer = ReplayBuffer.from_lerobot_dataset(
         offline_dataset,
@@ -1240,6 +1275,7 @@ def initialize_offline_replay_buffer(
         convert_actions_to_ee=convert_actions_to_ee,
         ee_action_scale=ee_action_scale,
         target_action_dim=target_action_dim,
+        frame_stack=frame_stack,
     )
 
     # Save to cache for future runs
