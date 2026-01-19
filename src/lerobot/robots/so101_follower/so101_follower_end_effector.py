@@ -242,13 +242,11 @@ class SO101FollowerEndEffector(SO101Follower):
         # Enforce locked joint positions from config (IK just preserves current, we need target)
         locked_joints = self.config.locked_joints or []
         locked_joint_positions = getattr(self.config, 'locked_joint_positions', {})
-        logger.info(f"send_action locked_joints={locked_joints}, locked_joint_positions={locked_joint_positions}")
         for joint_idx in locked_joints:
             if joint_idx < len(target_joints_rad):
                 # Try both int and string keys (JSON uses string keys)
                 target_deg = locked_joint_positions.get(joint_idx,
                              locked_joint_positions.get(str(joint_idx), 90.0))
-                logger.debug(f"Enforcing joint {joint_idx} to {target_deg}°")
                 target_joints_rad[joint_idx] = np.deg2rad(target_deg)
 
         target_joints_deg = np.rad2deg(target_joints_rad)

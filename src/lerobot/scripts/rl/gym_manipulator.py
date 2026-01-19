@@ -1154,6 +1154,14 @@ class ResetWrapper(gym.Wrapper):
                 delta_deg = np.clip(delta_deg, -max_delta, max_delta)
                 target_joints_deg = current_joints_deg + delta_deg
 
+                # 6a. Re-enforce locked joint positions after delta clamping
+                # (delta clamping would otherwise overwrite the enforcement from step 4b)
+                for joint_idx in locked_joints:
+                    if joint_idx < len(target_joints_deg):
+                        target_deg = locked_joint_positions.get(joint_idx,
+                                     locked_joint_positions.get(str(joint_idx), 90.0))
+                        target_joints_deg[joint_idx] = target_deg
+
                 # 6b. Clamp to valid encoder range (DEGREES mode doesn't clamp!)
                 target_joints_deg = _clamp_degrees(target_joints_deg)
 
