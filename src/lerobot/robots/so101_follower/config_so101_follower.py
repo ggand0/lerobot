@@ -57,7 +57,7 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
     ik_max_dq: float = 0.5  # Max joint velocity per step (radians)
 
     # Joints to lock during IK (0=shoulder_pan, 1=shoulder_lift, 2=elbow_flex, 3=wrist_flex, 4=wrist_roll)
-    locked_joints: list[int] = field(default_factory=lambda: [4])  # Lock wrist_roll by default
+    locked_joints: list[int] = field(default_factory=lambda: [3, 4])  # Lock wrist_flex and wrist_roll by default
 
     # Target positions (degrees) for locked joints during teleoperation
     # Maps joint index to target angle. If not specified, defaults to 90°.

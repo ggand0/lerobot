@@ -1075,6 +1075,7 @@ class ResetWrapper(gym.Wrapper):
             topdown_joints_deg = np.array([pos_dict[name] for name in _IK_MOTOR_NAMES])
             locked_joints = getattr(self.robot.config, 'locked_joints', None) or []
             locked_joint_positions = getattr(self.robot.config, 'locked_joint_positions', {})
+            logging.info(f"Step 2 locked_joints={locked_joints}, locked_joint_positions={locked_joint_positions}")
             for joint_idx in locked_joints:
                 if joint_idx < len(topdown_joints_deg):
                     target_deg = locked_joint_positions.get(joint_idx,
