@@ -505,7 +505,8 @@ def act_with_policy(
             if interaction_step >= cfg.policy.online_step_before_learning:
                 # Time policy inference and check if it meets FPS requirement
                 with policy_timer:
-                    action = policy.select_action(batch=obs)
+                    # Pass eval_mode=False and current step for exploration noise
+                    action = policy.select_action(batch=obs, step=interaction_step, eval_mode=False)
                 policy_fps = policy_timer.fps_last
 
                 log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)

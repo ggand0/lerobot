@@ -181,6 +181,7 @@ class EnvTransformConfig:
     add_ee_pose_to_observation: bool = False
     add_full_proprioception: bool = False  # 18-dim state: joint_pos + joint_vel + ee_xyz + ee_euler
     use_radians: bool = False  # Convert joint positions/velocities to radians (for RoboBase/Genesis compatibility)
+    sim2real_action_transform: bool = False  # Rotate actions by 90° for Genesis sim-to-real (robot facing -Y in sim, +X in real)
     normalize_images: bool = True  # If False, keep images as float32 [0, 255] for encoders with normalise_inputs=True (e.g., DrQ-v2)
     crop_params_dict: dict[str, tuple[int, int, int, int]] | None = None
     resize_size: tuple[int, int] | None = None
