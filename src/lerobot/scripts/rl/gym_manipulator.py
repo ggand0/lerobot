@@ -1349,6 +1349,40 @@ class GripperPenaltyWrapper(gym.RewardWrapper):
         return obs, info
 
 
+class Sim2RealActionTransformWrapper(gym.ActionWrapper):
+    """
+    Wrapper that transforms actions from Genesis sim coordinate frame to real robot frame.
+
+    Genesis sim has the robot rotated -90° around Z (facing -Y), while the real robot
+    faces +X. This wrapper rotates actions by +90° in the XY plane to correct for this.
+
+    Action format: [delta_x, delta_y, delta_z, gripper]
+    Transform: real_x = -sim_y, real_y = sim_x (90° rotation)
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+
+    def action(self, action):
+        """Transform action from sim to real coordinate frame."""
+        import numpy as np
+
+        if isinstance(action, np.ndarray):
+            transformed = action.copy()
+            # Rotate XY by +90°: [x, y] -> [-y, x]
+            transformed[0] = -action[1]  # real delta_x = -sim delta_y
+            transformed[1] = action[0]   # real delta_y = sim delta_x
+            # Z and gripper unchanged
+            return transformed
+        else:
+            # Handle torch tensors
+            import torch
+            transformed = action.clone()
+            transformed[..., 0] = -action[..., 1]
+            transformed[..., 1] = action[..., 0]
+            return transformed
+
+
 class GripperActionWrapper(gym.ActionWrapper):
     """
     Wrapper that processes gripper control commands.
@@ -2670,6 +2704,14 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     )
 
     env = BatchCompatibleWrapper(env=env)
+
+    # Apply sim-to-real action transformation if enabled
+    # This rotates actions by 90° to correct for Genesis sim coordinate frame (robot faces -Y)
+    # vs real robot frame (robot faces +X)
+    if getattr(cfg.wrapper, 'sim2real_action_transform', False):
+        logging.info("[ENV] Applying sim2real action transform (90° XY rotation)")
+        env = Sim2RealActionTransformWrapper(env=env)
+
     env = TorchActionWrapper(env=env, device=cfg.device)
 
     return env
