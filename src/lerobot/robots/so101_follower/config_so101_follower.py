@@ -57,11 +57,13 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
     ik_max_dq: float = 0.5  # Max joint velocity per step (radians)
 
     # Joints to lock during IK (0=shoulder_pan, 1=shoulder_lift, 2=elbow_flex, 3=wrist_flex, 4=wrist_roll)
-    locked_joints: list[int] = field(default_factory=lambda: [3, 4])  # Lock wrist_flex and wrist_roll by default
+    # Use None as default so JSON values override properly (draccus issue with default_factory)
+    locked_joints: list[int] | None = None
 
     # Target positions (degrees) for locked joints during teleoperation
     # Maps joint index to target angle. If not specified, defaults to 90°.
-    locked_joint_positions: dict[int, float] = field(default_factory=lambda: {3: 90.0, 4: 90.0})
+    # Use None as default so JSON values override properly
+    locked_joint_positions: dict[str, float] | None = None
 
     # Default bounds for the end-effector position (in meters)
     end_effector_bounds: dict[str, list[float]] = field(
@@ -75,3 +77,10 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
 
     # Action scale: meters per action unit (same as sim training)
     action_scale: float = 0.02
+
+    def __post_init__(self):
+        # Set defaults for fields that use None to work around draccus default_factory issues
+        if self.locked_joints is None:
+            self.locked_joints = [3, 4]  # Lock wrist_flex and wrist_roll by default
+        if self.locked_joint_positions is None:
+            self.locked_joint_positions = {"3": 90.0, "4": 90.0}
