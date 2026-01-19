@@ -1068,13 +1068,18 @@ class ResetWrapper(gym.Wrapper):
             logging.info(f"Step 1 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
 
             # ============================================================
-            # STEP 2: Set wrist to π/2 for top-down orientation
-            # wrist_flex (joint 3) = 90°, wrist_roll (joint 4) = 90°
+            # STEP 2: Set wrist to configured locked joint positions
+            # Uses locked_joint_positions from config (default 90° if not set)
             # ============================================================
-            logging.info("IK reset step 2: Setting top-down wrist orientation")
+            logging.info("IK reset step 2: Setting wrist to locked joint positions")
             topdown_joints_deg = np.array([pos_dict[name] for name in _IK_MOTOR_NAMES])
-            topdown_joints_deg[3] = 90.0   # wrist_flex = π/2
-            topdown_joints_deg[4] = 90.0   # wrist_roll = π/2 (corrected assembly)
+            locked_joints = getattr(self.robot.config, 'locked_joints', None) or []
+            locked_joint_positions = getattr(self.robot.config, 'locked_joint_positions', {})
+            for joint_idx in locked_joints:
+                if joint_idx < len(topdown_joints_deg):
+                    target_deg = locked_joint_positions.get(joint_idx,
+                                 locked_joint_positions.get(str(joint_idx), 90.0))
+                    topdown_joints_deg[joint_idx] = target_deg
             topdown_joints_deg = _clamp_degrees(topdown_joints_deg)
 
             action_dict = {name: topdown_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
