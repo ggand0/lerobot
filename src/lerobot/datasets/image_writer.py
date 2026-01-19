@@ -56,13 +56,16 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
         if range_check:
             max_ = image_array.max().item()
             min_ = image_array.min().item()
-            if max_ > 1.0 or min_ < 0.0:
+            # Allow small floating point tolerance (1e-5) for values near 0 and 1
+            if max_ > 1.0 + 1e-5 or min_ < -1e-5:
                 raise ValueError(
                     "The image data type is float, which requires values in the range [0.0, 1.0]. "
                     f"However, the provided range is [{min_}, {max_}]. Please adjust the range or "
                     "provide a uint8 image with values in the range [0, 255]."
                 )
 
+        # Clip to handle floating point precision issues
+        image_array = np.clip(image_array, 0.0, 1.0)
         image_array = (image_array * 255).astype(np.uint8)
 
     return PIL.Image.fromarray(image_array)
