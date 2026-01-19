@@ -102,6 +102,7 @@ class SO101FollowerEndEffector(SO101Follower):
         logger.info(f"Initialized MuJoCo IK with model: {model_path}")
         logger.info(f"EE site: {self.config.end_effector_site} (id={self.ee_site_id})")
         logger.info(f"Locked joints: {self.config.locked_joints}")
+        logger.info(f"Locked joint positions: {getattr(self.config, 'locked_joint_positions', {})}")
 
     def _sync_mujoco(self, joint_positions_rad: np.ndarray):
         """Sync MuJoCo model state with joint positions (radians)."""
@@ -237,6 +238,17 @@ class SO101FollowerEndEffector(SO101Follower):
 
         # Compute IK to get target joint positions (radians)
         target_joints_rad = self._compute_ik(target_ee_pos, current_joints_rad)
+
+        # Enforce locked joint positions from config (IK just preserves current, we need target)
+        locked_joints = self.config.locked_joints or []
+        locked_joint_positions = getattr(self.config, 'locked_joint_positions', {})
+        for joint_idx in locked_joints:
+            if joint_idx < len(target_joints_rad):
+                # Try both int and string keys (JSON uses string keys)
+                target_deg = locked_joint_positions.get(joint_idx,
+                             locked_joint_positions.get(str(joint_idx), 90.0))
+                target_joints_rad[joint_idx] = np.deg2rad(target_deg)
+
         target_joints_deg = np.rad2deg(target_joints_rad)
 
         # Build joint action dict

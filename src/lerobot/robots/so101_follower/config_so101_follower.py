@@ -59,6 +59,10 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
     # Joints to lock during IK (0=shoulder_pan, 1=shoulder_lift, 2=elbow_flex, 3=wrist_flex, 4=wrist_roll)
     locked_joints: list[int] = field(default_factory=lambda: [4])  # Lock wrist_roll by default
 
+    # Target positions (degrees) for locked joints during teleoperation
+    # Maps joint index to target angle. If not specified, defaults to 90°.
+    locked_joint_positions: dict[int, float] = field(default_factory=lambda: {3: 90.0, 4: 90.0})
+
     # Default bounds for the end-effector position (in meters)
     end_effector_bounds: dict[str, list[float]] = field(
         default_factory=lambda: {

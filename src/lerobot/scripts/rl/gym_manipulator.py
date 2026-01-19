@@ -462,10 +462,15 @@ class RobotEnv(gym.Env):
             locked_joints = getattr(self.robot.config, 'locked_joints', None)
             if locked_joints:
                 motor_names = list(self.robot.bus.motors.keys())
+                # Get configurable target positions (default 90° for backward compatibility)
+                locked_joint_positions = getattr(self.robot.config, 'locked_joint_positions', {})
                 for joint_idx in locked_joints:
                     if joint_idx < len(motor_names):
                         motor_name = motor_names[joint_idx]
-                        joint_action[f"{motor_name}.pos"] = 90.0  # Lock at 90°
+                        # Try both int and string keys (JSON uses string keys)
+                        target_pos = locked_joint_positions.get(joint_idx,
+                                     locked_joint_positions.get(str(joint_idx), 90.0))
+                        joint_action[f"{motor_name}.pos"] = target_pos
 
             self.robot.send_action(joint_action)
             self._leader_positions = None  # Clear after use
@@ -1124,6 +1129,15 @@ class ResetWrapper(gym.Wrapper):
 
                 # 4. Compute IK from actual current position
                 target_joints_rad = self.robot._compute_ik(self.ik_reset_ee_pos, current_joints_rad)
+
+                # 4b. Enforce locked joint positions from config (IK preserves current, we need target)
+                locked_joints = getattr(self.robot.config, 'locked_joints', None) or []
+                locked_joint_positions = getattr(self.robot.config, 'locked_joint_positions', {})
+                for joint_idx in locked_joints:
+                    if joint_idx < len(target_joints_rad):
+                        target_deg = locked_joint_positions.get(joint_idx,
+                                     locked_joint_positions.get(str(joint_idx), 90.0))
+                        target_joints_rad[joint_idx] = np.deg2rad(target_deg)
 
                 # 5. Convert back to degrees (simple rad2deg - bus expects DEGREES!)
                 target_joints_deg = np.rad2deg(target_joints_rad)
