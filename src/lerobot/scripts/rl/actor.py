@@ -100,6 +100,50 @@ SAFE_JOINTS_RAD = np.zeros(5)
 REST_JOINTS_RAD = np.array([-0.2424, -1.8040, 1.6582, 0.7309, -0.0629])
 
 
+def _robust_sync_read(bus, data_name: str, max_attempts: int = 5, delay_between_attempts: float = 0.1):
+    """
+    Robust sync_read with delays between retries for USB recovery.
+    """
+    import time
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return bus.sync_read(data_name, num_retry=0)
+        except ConnectionError as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                logging.warning(f"[ACTOR] sync_read attempt {attempt + 1}/{max_attempts} failed, waiting {delay_between_attempts}s...")
+                time.sleep(delay_between_attempts)
+                try:
+                    if hasattr(bus, 'port_handler') and bus.port_handler is not None:
+                        bus.port_handler.clearPort()
+                except Exception:
+                    pass
+    raise last_error
+
+
+def _robust_sync_write(bus, data_name: str, values, max_attempts: int = 5, delay_between_attempts: float = 0.1):
+    """
+    Robust sync_write with delays between retries for USB recovery.
+    """
+    import time
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return bus.sync_write(data_name, values, num_retry=0)
+        except ConnectionError as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                logging.warning(f"[ACTOR] sync_write attempt {attempt + 1}/{max_attempts} failed, waiting {delay_between_attempts}s...")
+                time.sleep(delay_between_attempts)
+                try:
+                    if hasattr(bus, 'port_handler') and bus.port_handler is not None:
+                        bus.port_handler.clearPort()
+                except Exception:
+                    pass
+    raise last_error
+
+
 class FrameStackBuffer:
     """Buffer for stacking frames across timesteps."""
 
@@ -321,8 +365,8 @@ def safe_return_to_home(online_env):
         # Step 1: Lift up to safe height (keep wrist orientation)
         logging.info("[ACTOR] Step 1: Lifting to safe height...")
         try:
-            # Read current position (with retries for USB stability)
-            pos_dict = bus.sync_read("Present_Position", num_retry=3)
+            # Read current position (with robust retries for USB stability)
+            pos_dict = _robust_sync_read(bus, "Present_Position")
             current_deg = np.array([pos_dict[name] for name in motor_names])
             current_rad = np.deg2rad(current_deg)
 
@@ -335,8 +379,8 @@ def safe_return_to_home(online_env):
             safe_height_target[2] = 0.15
 
             for step in range(40):
-                # Read current position (with retries for USB stability)
-                pos_dict = bus.sync_read("Present_Position", num_retry=3)
+                # Read current position (with robust retries for USB stability)
+                pos_dict = _robust_sync_read(bus, "Present_Position")
                 current_deg = np.array([pos_dict[name] for name in motor_names])
                 current_rad = np.deg2rad(current_deg)
 
@@ -359,10 +403,10 @@ def safe_return_to_home(online_env):
                 # Clamp to valid encoder range
                 target_deg = _clamp_degrees(target_deg)
 
-                # Send command (with retries for USB stability)
+                # Send command (with robust retries for USB stability)
                 action_dict = {name: target_deg[i] for i, name in enumerate(motor_names)}
                 action_dict["gripper"] = pos_dict.get("gripper", 50.0)
-                bus.sync_write("Goal_Position", action_dict, num_retry=3)
+                _robust_sync_write(bus, "Goal_Position", action_dict)
                 busy_wait(0.05)
 
                 # Check if high enough
@@ -382,7 +426,7 @@ def safe_return_to_home(online_env):
         rest_deg = _clamp_degrees(rest_deg)  # Clamp to valid encoder range
         action_dict = {name: rest_deg[i] for i, name in enumerate(motor_names)}
         action_dict["gripper"] = -50.0  # Close gripper at rest
-        bus.sync_write("Goal_Position", action_dict, num_retry=3)
+        _robust_sync_write(bus, "Goal_Position", action_dict)
         busy_wait(1.0)
 
         logging.info("[ACTOR] Safe return complete")
