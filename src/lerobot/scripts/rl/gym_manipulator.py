@@ -1425,6 +1425,11 @@ class Sim2RealActionTransformWrapper(gym.ActionWrapper):
         else:
             # Handle torch tensors
             import torch
+            if not hasattr(self, '_log_counter'):
+                self._log_counter = 0
+            self._log_counter += 1
+            if self._log_counter % 50 == 0:  # Log every 50 steps
+                logging.info(f"[Sim2Real] sim_action={action.cpu().numpy().flatten()[:3]} -> real_action after transform")
             transformed = action.clone()
             transformed[..., 0] = -action[..., 1]
             transformed[..., 1] = action[..., 0]
