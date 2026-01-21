@@ -553,6 +553,11 @@ def act_with_policy(
                     action = policy.select_action(batch=obs, step=interaction_step, eval_mode=False)
                 policy_fps = policy_timer.fps_last
 
+                # Debug: log policy action every 50 steps
+                if interaction_step % 50 == 0:
+                    action_np = action.cpu().numpy().flatten() if hasattr(action, 'cpu') else action
+                    logging.info(f"[ACTOR] step={interaction_step} policy_action={action_np}")
+
                 log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
 
             else:
