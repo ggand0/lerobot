@@ -146,7 +146,7 @@ def _clamp_degrees(joints_deg: np.ndarray) -> np.ndarray:
 
 
 def reset_follower_position(robot_arm, target_position):
-    current_position_dict = robot_arm.bus.sync_read("Present_Position")
+    current_position_dict = robot_arm.bus.sync_read("Present_Position", num_retry=3)
     current_position = np.array(
         [current_position_dict[name] for name in current_position_dict], dtype=np.float32
     )
@@ -157,12 +157,12 @@ def reset_follower_position(robot_arm, target_position):
     )
     for i, pose in enumerate(trajectory):
         action_dict = dict(zip(current_position_dict, pose, strict=False))
-        robot_arm.bus.sync_write("Goal_Position", action_dict)
+        robot_arm.bus.sync_write("Goal_Position", action_dict, num_retry=3)
         busy_wait(0.025)  # 25ms per step = 3.75 seconds total
     # Extra settle time
     busy_wait(0.5)
     # Verify final position
-    final_pos_dict = robot_arm.bus.sync_read("Present_Position")
+    final_pos_dict = robot_arm.bus.sync_read("Present_Position", num_retry=3)
     final_pos = np.array([final_pos_dict[name] for name in final_pos_dict], dtype=np.float32)
     logging.info(f"reset_follower_position: final={final_pos}, diff={np.abs(final_pos - target_position).max():.2f}")
 
@@ -636,7 +636,7 @@ class AddCurrentToObservation(gym.ObservationWrapper):
         Returns:
             The modified observation with current values.
         """
-        present_current_dict = self.env.unwrapped.robot.bus.sync_read("Present_Current")
+        present_current_dict = self.env.unwrapped.robot.bus.sync_read("Present_Current", num_retry=3)
         present_current_observation = np.array(
             [present_current_dict[name] for name in self.env.unwrapped.robot.bus.motors]
         )
@@ -1046,8 +1046,8 @@ class ResetWrapper(gym.Wrapper):
             # ================================================================
             logging.info(f"IK reset to EE target: {self.ik_reset_ee_pos}")
 
-            # Check torque status
-            torque_status = self.robot.bus.sync_read("Torque_Enable")
+            # Check torque status (with retries for USB stability)
+            torque_status = self.robot.bus.sync_read("Torque_Enable", num_retry=3)
             logging.info(f"Motor torque status: {torque_status}")
 
             # ============================================================
@@ -1061,10 +1061,10 @@ class ResetWrapper(gym.Wrapper):
             action_dict = {name: safe_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
             action_dict["gripper"] = 50.0  # Open gripper
             logging.info(f"Step 1 sending: {action_dict}")
-            self.robot.bus.sync_write("Goal_Position", action_dict)
+            self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
             busy_wait(1.5)  # Wait for robot to reach safe position
 
-            pos_dict = self.robot.bus.sync_read("Present_Position")
+            pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
             logging.info(f"Step 1 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
 
             # ============================================================
@@ -1086,10 +1086,10 @@ class ResetWrapper(gym.Wrapper):
             action_dict = {name: topdown_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
             action_dict["gripper"] = 50.0
             logging.info(f"Step 2 sending: {action_dict}")
-            self.robot.bus.sync_write("Goal_Position", action_dict)
+            self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
             busy_wait(1.0)
 
-            pos_dict = self.robot.bus.sync_read("Present_Position")
+            pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
             logging.info(f"Step 2 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
 
             # ============================================================
@@ -1101,8 +1101,8 @@ class ResetWrapper(gym.Wrapper):
             stuck_count = 0
 
             for ik_step in range(50):
-                # 1. Read actual robot position - bus returns DEGREES
-                current_pos_dict = self.robot.bus.sync_read("Present_Position")
+                # 1. Read actual robot position - bus returns DEGREES (with retries)
+                current_pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
                 current_joints_deg = np.array([current_pos_dict[name] for name in _IK_MOTOR_NAMES])
 
                 # 2. Convert to radians (simple deg2rad - bus uses DEGREES mode!)
@@ -1174,7 +1174,7 @@ class ResetWrapper(gym.Wrapper):
                 if ik_step % 10 == 0:
                     logging.info(f"Step 3 iter {ik_step}: error={error:.4f}m, EE={current_ee}")
 
-                self.robot.bus.sync_write("Goal_Position", action_dict)
+                self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
 
                 # 8. Wait for robot to move (100ms to allow motor movement)
                 busy_wait(0.1)
@@ -1187,7 +1187,7 @@ class ResetWrapper(gym.Wrapper):
 
             # Disable leader torque so user can teleoperate freely
             if hasattr(self.env, "robot_leader"):
-                self.env.robot_leader.bus.sync_write("Torque_Enable", 0)
+                self.env.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
                 logging.info("Leader torque disabled for teleoperation")
 
             log_say("Episode starting", play_sounds=True)
@@ -1205,7 +1205,7 @@ class ResetWrapper(gym.Wrapper):
             log_say("Reset the environment done.", play_sounds=False)
 
             if hasattr(self.env, "robot_leader"):
-                self.env.robot_leader.bus.sync_write("Torque_Enable", 1)
+                self.env.robot_leader.bus.sync_write("Torque_Enable", 1, num_retry=3)
                 log_say("Reset the leader robot.", play_sounds=False)
                 reset_follower_position(self.env.robot_leader, reset_pose)
                 log_say("Reset the leader robot done.", play_sounds=False)
@@ -1219,7 +1219,7 @@ class ResetWrapper(gym.Wrapper):
                 # For SO-101 without URDF, directly mirror leader joint positions
                 if hasattr(self.env, 'robot_leader') and not hasattr(self.unwrapped.robot.config, 'urdf_path'):
                     # Read leader positions and mirror to follower
-                    leader_pos_dict = self.env.robot_leader.bus.sync_read("Present_Position")
+                    leader_pos_dict = self.env.robot_leader.bus.sync_read("Present_Position", num_retry=3)
                     joint_action = {f"{name}.pos": pos for name, pos in leader_pos_dict.items()}
                     self.unwrapped.robot.send_action(joint_action)
                 else:
@@ -1323,7 +1323,7 @@ class GripperPenaltyWrapper(gym.RewardWrapper):
         Returns:
             Tuple of (observation, reward, terminated, truncated, info) with penalty applied.
         """
-        self.last_gripper_state = self.unwrapped.robot.bus.sync_read("Present_Position")["gripper"]
+        self.last_gripper_state = self.unwrapped.robot.bus.sync_read("Present_Position", num_retry=3)["gripper"]
 
         gripper_action = action[-1]
         obs, reward, terminated, truncated, info = self.env.step(action)
@@ -1357,7 +1357,8 @@ class Sim2RealActionTransformWrapper(gym.ActionWrapper):
     faces +X. This wrapper rotates actions by +90° in the XY plane to correct for this.
 
     Action format: [delta_x, delta_y, delta_z, gripper]
-    Transform: real_x = -sim_y, real_y = sim_x (90° rotation)
+    Transform (sim→real): real_x = -sim_y, real_y = sim_x (90° rotation)
+    Inverse (real→sim): sim_x = real_y, sim_y = -real_x
     """
 
     def __init__(self, env):
@@ -1381,6 +1382,31 @@ class Sim2RealActionTransformWrapper(gym.ActionWrapper):
             transformed[..., 0] = -action[..., 1]
             transformed[..., 1] = action[..., 0]
             return transformed
+
+    def step(self, action):
+        """Step with action transform and inverse-transform intervention actions."""
+        import numpy as np
+        import torch
+
+        # Transform policy action from sim→real (handled by parent ActionWrapper)
+        obs, reward, done, truncated, info = super().step(action)
+
+        # Inverse-transform intervention action from real→sim for consistent recording
+        if "action_intervention" in info and info["action_intervention"] is not None:
+            intervention = info["action_intervention"]
+            if isinstance(intervention, np.ndarray):
+                transformed = intervention.copy()
+                # Inverse: sim_x = real_y, sim_y = -real_x
+                transformed[0] = intervention[1]
+                transformed[1] = -intervention[0]
+                info["action_intervention"] = transformed
+            elif isinstance(intervention, torch.Tensor):
+                transformed = intervention.clone()
+                transformed[..., 0] = intervention[..., 1]
+                transformed[..., 1] = -intervention[..., 0]
+                info["action_intervention"] = transformed
+
+        return obs, reward, done, truncated, info
 
 
 class GripperActionWrapper(gym.ActionWrapper):
@@ -1439,7 +1465,7 @@ class GripperActionWrapper(gym.ActionWrapper):
         max_gripper_pos = getattr(self.unwrapped.robot.config, 'max_gripper_pos', 100)
         gripper_command = gripper_command * max_gripper_pos
 
-        gripper_state = self.unwrapped.robot.bus.sync_read("Present_Position")["gripper"]
+        gripper_state = self.unwrapped.robot.bus.sync_read("Present_Position", num_retry=3)["gripper"]
 
         gripper_action_value = np.clip(
             gripper_state + gripper_command, 0, max_gripper_pos
@@ -1742,7 +1768,7 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         # With lower gains we can manually move the leader arm without risk of injury to ourselves or the robot
         # With higher gains, it would be dangerous and difficult to modify the leader's pose while torque is enabled
         # Default value for P_coeff is 32
-        self.robot_leader.bus.sync_write("Torque_Enable", 1)
+        self.robot_leader.bus.sync_write("Torque_Enable", 1, num_retry=3)
         for motor in self.robot_leader.bus.motors:
             self.robot_leader.bus.write("P_Coefficient", motor, 16)
             self.robot_leader.bus.write("I_Coefficient", motor, 0)
@@ -1878,11 +1904,12 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             Tuple of (modified_action, intervention_action).
         """
         if self.leader_torque_enabled:
-            self.robot_leader.bus.sync_write("Torque_Enable", 0)
+            self.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
             self.leader_torque_enabled = False
 
-        leader_pos_dict = self.robot_leader.bus.sync_read("Present_Position")
-        follower_pos_dict = self.robot_follower.bus.sync_read("Present_Position")
+        # Use retries to handle transient USB communication failures
+        leader_pos_dict = self.robot_leader.bus.sync_read("Present_Position", num_retry=3)
+        follower_pos_dict = self.robot_follower.bus.sync_read("Present_Position", num_retry=3)
 
         leader_pos = np.array([leader_pos_dict[name] for name in leader_pos_dict])
         follower_pos = np.array([follower_pos_dict[name] for name in follower_pos_dict])
@@ -1974,20 +2001,20 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         This method synchronizes the leader robot position with the follower.
         """
 
-        prev_leader_pos_dict = self.robot_leader.bus.sync_read("Present_Position")
+        prev_leader_pos_dict = self.robot_leader.bus.sync_read("Present_Position", num_retry=3)
         prev_leader_pos = np.array(
             [prev_leader_pos_dict[name] for name in prev_leader_pos_dict], dtype=np.float32
         )
 
         if not self.leader_torque_enabled:
-            self.robot_leader.bus.sync_write("Torque_Enable", 1)
+            self.robot_leader.bus.sync_write("Torque_Enable", 1, num_retry=3)
             self.leader_torque_enabled = True
 
-        follower_pos_dict = self.robot_follower.bus.sync_read("Present_Position")
+        follower_pos_dict = self.robot_follower.bus.sync_read("Present_Position", num_retry=3)
         follower_pos = np.array([follower_pos_dict[name] for name in follower_pos_dict], dtype=np.float32)
 
         goal_pos = {f"{motor}": follower_pos[i] for i, motor in enumerate(self.robot_leader.bus.motors)}
-        self.robot_leader.bus.sync_write("Goal_Position", goal_pos)
+        self.robot_leader.bus.sync_write("Goal_Position", goal_pos, num_retry=3)
 
         self.leader_tracking_error_queue.append(np.linalg.norm(follower_pos[:-1] - prev_leader_pos[:-1]))
 
@@ -2024,7 +2051,7 @@ class BaseLeaderControlWrapper(gym.Wrapper):
 
         max_gripper_pos = getattr(self.robot_follower.config, 'max_gripper_pos', 100)
         self.prev_leader_gripper = np.clip(
-            self.robot_leader.bus.sync_read("Present_Position")["gripper"],
+            self.robot_leader.bus.sync_read("Present_Position", num_retry=3)["gripper"],
             0,
             max_gripper_pos,
         )
