@@ -145,6 +145,53 @@ def _clamp_degrees(joints_deg: np.ndarray) -> np.ndarray:
     return clamped
 
 
+def _robust_sync_read(bus, data_name: str, max_attempts: int = 5, delay_between_attempts: float = 0.1):
+    """
+    Robust sync_read with delays between retries and port recovery.
+
+    When USB connection drops, immediate retries fail. This function adds delays
+    between attempts and tries to recover by clearing/flushing the port.
+    """
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            # Use num_retry=0 here since we handle retries ourselves with delays
+            return bus.sync_read(data_name, num_retry=0)
+        except ConnectionError as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                logging.warning(f"sync_read attempt {attempt + 1}/{max_attempts} failed, waiting {delay_between_attempts}s...")
+                time.sleep(delay_between_attempts)
+                # Try to clear any pending data in the serial buffer
+                try:
+                    if hasattr(bus, 'port_handler') and bus.port_handler is not None:
+                        bus.port_handler.clearPort()
+                except Exception:
+                    pass
+    raise last_error
+
+
+def _robust_sync_write(bus, data_name: str, values, max_attempts: int = 5, delay_between_attempts: float = 0.1):
+    """
+    Robust sync_write with delays between retries and port recovery.
+    """
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return bus.sync_write(data_name, values, num_retry=0)
+        except ConnectionError as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                logging.warning(f"sync_write attempt {attempt + 1}/{max_attempts} failed, waiting {delay_between_attempts}s...")
+                time.sleep(delay_between_attempts)
+                try:
+                    if hasattr(bus, 'port_handler') and bus.port_handler is not None:
+                        bus.port_handler.clearPort()
+                except Exception:
+                    pass
+    raise last_error
+
+
 def reset_follower_position(robot_arm, target_position):
     current_position_dict = robot_arm.bus.sync_read("Present_Position", num_retry=3)
     current_position = np.array(
@@ -1904,12 +1951,12 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             Tuple of (modified_action, intervention_action).
         """
         if self.leader_torque_enabled:
-            self.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
+            _robust_sync_write(self.robot_leader.bus, "Torque_Enable", 0)
             self.leader_torque_enabled = False
 
-        # Use retries to handle transient USB communication failures
-        leader_pos_dict = self.robot_leader.bus.sync_read("Present_Position", num_retry=3)
-        follower_pos_dict = self.robot_follower.bus.sync_read("Present_Position", num_retry=3)
+        # Use robust functions with delays to handle USB communication failures
+        leader_pos_dict = _robust_sync_read(self.robot_leader.bus, "Present_Position")
+        follower_pos_dict = _robust_sync_read(self.robot_follower.bus, "Present_Position")
 
         leader_pos = np.array([leader_pos_dict[name] for name in leader_pos_dict])
         follower_pos = np.array([follower_pos_dict[name] for name in follower_pos_dict])
@@ -2001,20 +2048,20 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         This method synchronizes the leader robot position with the follower.
         """
 
-        prev_leader_pos_dict = self.robot_leader.bus.sync_read("Present_Position", num_retry=3)
+        prev_leader_pos_dict = _robust_sync_read(self.robot_leader.bus, "Present_Position")
         prev_leader_pos = np.array(
             [prev_leader_pos_dict[name] for name in prev_leader_pos_dict], dtype=np.float32
         )
 
         if not self.leader_torque_enabled:
-            self.robot_leader.bus.sync_write("Torque_Enable", 1, num_retry=3)
+            _robust_sync_write(self.robot_leader.bus, "Torque_Enable", 1)
             self.leader_torque_enabled = True
 
-        follower_pos_dict = self.robot_follower.bus.sync_read("Present_Position", num_retry=3)
+        follower_pos_dict = _robust_sync_read(self.robot_follower.bus, "Present_Position")
         follower_pos = np.array([follower_pos_dict[name] for name in follower_pos_dict], dtype=np.float32)
 
         goal_pos = {f"{motor}": follower_pos[i] for i, motor in enumerate(self.robot_leader.bus.motors)}
-        self.robot_leader.bus.sync_write("Goal_Position", goal_pos, num_retry=3)
+        _robust_sync_write(self.robot_leader.bus, "Goal_Position", goal_pos)
 
         self.leader_tracking_error_queue.append(np.linalg.norm(follower_pos[:-1] - prev_leader_pos[:-1]))
 
@@ -2051,7 +2098,7 @@ class BaseLeaderControlWrapper(gym.Wrapper):
 
         max_gripper_pos = getattr(self.robot_follower.config, 'max_gripper_pos', 100)
         self.prev_leader_gripper = np.clip(
-            self.robot_leader.bus.sync_read("Present_Position", num_retry=3)["gripper"],
+            _robust_sync_read(self.robot_leader.bus, "Present_Position")["gripper"],
             0,
             max_gripper_pos,
         )
