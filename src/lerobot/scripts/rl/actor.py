@@ -553,10 +553,18 @@ def act_with_policy(
                     action = policy.select_action(batch=obs, step=interaction_step, eval_mode=False)
                 policy_fps = policy_timer.fps_last
 
-                # Debug: log policy action every 50 steps
+                # Debug: log policy action and observation info every 50 steps
                 if interaction_step % 50 == 0:
                     action_np = action.cpu().numpy().flatten() if hasattr(action, 'cpu') else action
+                    # Log observation shapes and sample values
+                    obs_info = {}
+                    for k, v in obs.items():
+                        if hasattr(v, 'shape'):
+                            obs_info[k] = f"shape={v.shape}, min={v.min().item():.2f}, max={v.max().item():.2f}"
+                        else:
+                            obs_info[k] = f"type={type(v)}"
                     logging.info(f"[ACTOR] step={interaction_step} policy_action={action_np}")
+                    logging.info(f"[ACTOR] obs shapes: {obs_info}")
 
                 log_policy_frequency_issue(policy_fps=policy_fps, cfg=cfg, interaction_step=interaction_step)
 
