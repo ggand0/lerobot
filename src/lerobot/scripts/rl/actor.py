@@ -321,8 +321,8 @@ def safe_return_to_home(online_env):
         # Step 1: Lift up to safe height (keep wrist orientation)
         logging.info("[ACTOR] Step 1: Lifting to safe height...")
         try:
-            # Read current position
-            pos_dict = bus.sync_read("Present_Position")
+            # Read current position (with retries for USB stability)
+            pos_dict = bus.sync_read("Present_Position", num_retry=3)
             current_deg = np.array([pos_dict[name] for name in motor_names])
             current_rad = np.deg2rad(current_deg)
 
@@ -335,8 +335,8 @@ def safe_return_to_home(online_env):
             safe_height_target[2] = 0.15
 
             for step in range(40):
-                # Read current position
-                pos_dict = bus.sync_read("Present_Position")
+                # Read current position (with retries for USB stability)
+                pos_dict = bus.sync_read("Present_Position", num_retry=3)
                 current_deg = np.array([pos_dict[name] for name in motor_names])
                 current_rad = np.deg2rad(current_deg)
 
@@ -359,10 +359,10 @@ def safe_return_to_home(online_env):
                 # Clamp to valid encoder range
                 target_deg = _clamp_degrees(target_deg)
 
-                # Send command
+                # Send command (with retries for USB stability)
                 action_dict = {name: target_deg[i] for i, name in enumerate(motor_names)}
                 action_dict["gripper"] = pos_dict.get("gripper", 50.0)
-                bus.sync_write("Goal_Position", action_dict)
+                bus.sync_write("Goal_Position", action_dict, num_retry=3)
                 busy_wait(0.05)
 
                 # Check if high enough
@@ -382,7 +382,7 @@ def safe_return_to_home(online_env):
         rest_deg = _clamp_degrees(rest_deg)  # Clamp to valid encoder range
         action_dict = {name: rest_deg[i] for i, name in enumerate(motor_names)}
         action_dict["gripper"] = -50.0  # Close gripper at rest
-        bus.sync_write("Goal_Position", action_dict)
+        bus.sync_write("Goal_Position", action_dict, num_retry=3)
         busy_wait(1.0)
 
         logging.info("[ACTOR] Safe return complete")
