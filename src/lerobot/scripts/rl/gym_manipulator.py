@@ -695,7 +695,7 @@ class AddCurrentToObservation(gym.ObservationWrapper):
 
 
 class RewardWrapper(gym.Wrapper):
-    def __init__(self, env, reward_classifier, device="cuda"):
+    def __init__(self, env, reward_classifier, device="cuda", min_steps_before_success=50):
         """
         Wrapper to add reward prediction to the environment using a trained classifier.
 
@@ -703,10 +703,13 @@ class RewardWrapper(gym.Wrapper):
             env: The environment to wrap.
             reward_classifier: The reward classifier model.
             device: The device to run the model on.
+            min_steps_before_success: Minimum steps before allowing success termination.
         """
         self.env = env
 
         self.device = device
+        self.min_steps_before_success = min_steps_before_success
+        self.current_step = 0
 
         self.reward_classifier = torch.compile(reward_classifier)
         self.reward_classifier.to(self.device)
@@ -722,6 +725,7 @@ class RewardWrapper(gym.Wrapper):
             Tuple of (observation, reward, terminated, truncated, info).
         """
         observation, _, terminated, truncated, info = self.env.step(action)
+        self.current_step += 1
 
         images = {}
         for key in observation:
@@ -741,22 +745,16 @@ class RewardWrapper(gym.Wrapper):
 
         reward = 0.0
         if success == 1.0:
-            terminated = True
             reward = 1.0
+            # Only terminate on success after minimum steps
+            if self.current_step >= self.min_steps_before_success:
+                terminated = True
 
         return observation, reward, terminated, truncated, info
 
     def reset(self, seed=None, options=None):
-        """
-        Reset the environment.
-
-        Args:
-            seed: Random seed for reproducibility.
-            options: Additional reset options.
-
-        Returns:
-            The initial observation and info from the wrapped environment.
-        """
+        """Reset the environment and step counter."""
+        self.current_step = 0
         return self.env.reset(seed=seed, options=options)
 
 
@@ -1283,6 +1281,8 @@ class ResetWrapper(gym.Wrapper):
             log_say("Manual reset of the environment done.", play_sounds=False)
 
         busy_wait(self.reset_time_s - (time.perf_counter() - start_time))
+
+        log_say("Episode starting", play_sounds=True)
 
         return super().reset(seed=seed, options=options)
 
@@ -1885,11 +1885,13 @@ class BaseLeaderControlWrapper(gym.Wrapper):
                 try:
                     with self.event_lock:
                         if key == keyboard.Key.esc:
-                            logging.info("ESC pressed. Ending episode.")
-                            self.keyboard_events["episode_end"] = True
+                            if not self.keyboard_events["episode_end"]:
+                                logging.info("ESC pressed. Ending episode.")
+                                self.keyboard_events["episode_end"] = True
                         elif hasattr(key, 'char') and key.char == 'k':
-                            logging.info("Key 'k' pressed. Episode success triggered.")
-                            self.keyboard_events["episode_success"] = True
+                            if not self.keyboard_events["episode_success"]:
+                                logging.info("Key 'k' pressed. Episode success triggered.")
+                                self.keyboard_events["episode_success"] = True
                         elif hasattr(key, 'char') and key.char == 'i':
                             self._handle_intervention_key()
                         elif key == keyboard.Key.left:
