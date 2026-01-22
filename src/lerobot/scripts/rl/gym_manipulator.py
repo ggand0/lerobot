@@ -37,6 +37,7 @@ Example:
 """
 
 import logging
+import signal
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -2768,8 +2769,8 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     else:
         raise ValueError(f"Invalid control mode: {control_mode}")
 
-    # Use IK reset if robot has MuJoCo model (SO101FollowerEndEffector)
-    use_ik_reset = hasattr(cfg.robot, 'mujoco_model_path') and cfg.robot.mujoco_model_path is not None
+    # Use IK reset if explicitly enabled in config
+    use_ik_reset = getattr(cfg.wrapper, 'use_ik_reset', False)
     ik_reset_ee_pos = getattr(cfg.wrapper, 'ik_reset_ee_pos', None)
     reset_delay_s = getattr(cfg.wrapper, 'reset_delay_s', 0.0)
 
@@ -2978,7 +2979,6 @@ def record_dataset(env, policy, cfg):
                 logging.info(f"Collected {success_steps_collected} additional success states")
                 break
 
-        log_say("Episode ended", play_sounds=True)
         logging.info("Episode ended")
 
         # Handle episode recording
@@ -3039,6 +3039,14 @@ def main(cfg: EnvConfig):
              including mode (record, replay, random) and other settings.
     """
     env = make_robot_env(cfg)
+
+    # Set up signal handler to properly close env on Ctrl+C
+    def signal_handler(sig, frame):
+        logging.info("Ctrl+C received, closing environment...")
+        env.close()
+        exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
 
     if cfg.mode == "record":
         policy = None
