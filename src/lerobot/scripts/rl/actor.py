@@ -549,8 +549,8 @@ def act_with_policy(
             if interaction_step >= cfg.policy.online_step_before_learning:
                 # Time policy inference and check if it meets FPS requirement
                 with policy_timer:
-                    # Pass eval_mode=False and current step for exploration noise
-                    action = policy.select_action(batch=obs, step=interaction_step, eval_mode=False)
+                    # SACPolicy.select_action only takes batch parameter
+                    action = policy.select_action(batch=obs)
                 policy_fps = policy_timer.fps_last
 
                 # Debug: log policy action and observation info every 50 steps

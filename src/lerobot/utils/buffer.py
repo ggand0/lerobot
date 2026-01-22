@@ -625,7 +625,8 @@ class ReplayBuffer:
                     val = val * 255.0
 
                 # Compute full proprioception for observation.state
-                if compute_full_proprioception and key == "observation.state" and mj_model is not None:
+                # Skip if state is already 18-dim (full proprioception already computed in dataset)
+                if compute_full_proprioception and key == "observation.state" and mj_model is not None and val.shape[0] <= 6:
                     import mujoco
                     joint_pos = val.numpy()  # 6-dim joint positions (degrees)
                     num_dof = len(joint_pos)
