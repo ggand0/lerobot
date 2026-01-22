@@ -1038,6 +1038,7 @@ class ResetWrapper(gym.Wrapper):
         use_ik_reset: bool = False,
         ik_reset_ee_pos: list | None = None,
         reset_delay_s: float = 0.0,
+        capture_home_on_start: bool = False,
     ):
         """
         Initialize the reset wrapper.
@@ -1053,6 +1054,7 @@ class ResetWrapper(gym.Wrapper):
                     - y=-0.015 (cube_y + FINGER_WIDTH_OFFSET)
                     - z=0.05 (CUBE_Z + GRASP_Z_OFFSET + HEIGHT_OFFSET = 0.015 + 0.005 + 0.03)
             reset_delay_s: Time in seconds to wait after reset (for repositioning objects).
+            capture_home_on_start: If True, use current position as home (no reset motion).
         """
         super().__init__(env)
         self.reset_time_s = reset_time_s
@@ -1063,6 +1065,7 @@ class ResetWrapper(gym.Wrapper):
         self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.25, -0.015, 0.05])
         self.reset_delay_s = reset_delay_s
         self._ik_reset_pose = None  # Cached IK-computed reset pose
+        self.capture_home_on_start = capture_home_on_start
 
     def reset(self, *, seed=None, options=None):
         """
@@ -1080,7 +1083,7 @@ class ResetWrapper(gym.Wrapper):
         """
         start_time = time.perf_counter()
 
-        # Determine reset pose: use IK if enabled, otherwise use fixed pose
+        # Determine reset pose: use IK if enabled, otherwise use fixed pose or current position
         reset_pose = self.reset_pose
         if self.use_ik_reset and hasattr(self.robot, '_compute_ik'):
             # ================================================================
@@ -1247,16 +1250,18 @@ class ResetWrapper(gym.Wrapper):
 
             return super().reset(seed=seed, options=options)
 
-        if reset_pose is not None:
+        if self.capture_home_on_start:
+            # Use current position as home - no reset motion needed
+            logging.info("Using current position as home (no reset motion)")
+        elif reset_pose is not None:
             log_say("Reset the environment.", play_sounds=False)
             reset_follower_position(self.unwrapped.robot, reset_pose)
             log_say("Reset the environment done.", play_sounds=False)
 
             if hasattr(self.env, "robot_leader"):
-                self.env.robot_leader.bus.sync_write("Torque_Enable", 1, num_retry=3)
-                log_say("Reset the leader robot.", play_sounds=False)
-                reset_follower_position(self.env.robot_leader, reset_pose)
-                log_say("Reset the leader robot done.", play_sounds=False)
+                # Disable torque on leader so user can move it freely
+                self.env.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
+                log_say("Leader arm free.", play_sounds=False)
         else:
             log_say(
                 f"Manually reset the environment for {self.reset_time_s} seconds.",
@@ -2109,20 +2114,28 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             max_gripper_pos,
         )
 
-        # Check for success or manual termination
+        # Check for success or manual termination (read and clear events)
         success = self.keyboard_events["episode_success"]
         rerecord = self.keyboard_events["rerecord_episode"]
-        terminated = terminated or self.keyboard_events["episode_end"] or success
+        episode_end = self.keyboard_events["episode_end"]
+        terminated = terminated or episode_end or success
 
+        # Clear keyboard events after reading to prevent spam
         if success:
+            self.keyboard_events["episode_success"] = False
             reward = 1.0
             logging.info("Episode ended successfully with reward 1.0")
             log_say("Episode success", play_sounds=True)
         elif terminated or truncated:
             log_say("Episode ended", play_sounds=True)
 
+        if episode_end:
+            self.keyboard_events["episode_end"] = False
+
         # Propagate rerecord signal to info for recording loop
         info["rerecord_episode"] = rerecord
+        if rerecord:
+            self.keyboard_events["rerecord_episode"] = False
 
         return obs, reward, terminated, truncated, info
 
@@ -2773,6 +2786,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     use_ik_reset = getattr(cfg.wrapper, 'use_ik_reset', False)
     ik_reset_ee_pos = getattr(cfg.wrapper, 'ik_reset_ee_pos', None)
     reset_delay_s = getattr(cfg.wrapper, 'reset_delay_s', 0.0)
+    capture_home_on_start = getattr(cfg.wrapper, 'capture_home_on_start', False)
 
     env = ResetWrapper(
         env=env,
@@ -2781,6 +2795,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
         use_ik_reset=use_ik_reset,
         ik_reset_ee_pos=ik_reset_ee_pos,
         reset_delay_s=reset_delay_s,
+        capture_home_on_start=capture_home_on_start,
     )
 
     env = BatchCompatibleWrapper(env=env)
@@ -2937,7 +2952,15 @@ def record_dataset(env, policy, cfg):
             }
 
             # Process observation for dataset
-            obs_processed = {k: v.cpu().squeeze(0).float() for k, v in obs.items()}
+            obs_processed = {}
+            for k, v in obs.items():
+                v = v.cpu().squeeze(0)
+                # Convert images to uint8 for dataset storage
+                if "image" in k and v.dtype == torch.float32:
+                    v = v.clamp(0, 255).to(torch.uint8)
+                else:
+                    v = v.float()
+                obs_processed[k] = v
 
             # Check if we've just detected success
             if reward == 1.0 and not success_detected:

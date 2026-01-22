@@ -191,6 +191,7 @@ class EnvTransformConfig:
     reset_delay_s: float = 0.0  # Delay after reset for repositioning objects
     use_ik_reset: bool = False  # If True, use IK to compute reset joint positions from EE target
     ik_reset_ee_pos: list[float] | None = None  # Target EE position [x, y, z] for IK reset
+    capture_home_on_start: bool = False  # If True, capture current position as home on first reset
     use_gripper: bool = True
     gripper_quantization_threshold: float | None = 0.8
     gripper_penalty: float = 0.0
