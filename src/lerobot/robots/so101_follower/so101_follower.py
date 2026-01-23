@@ -157,6 +157,10 @@ class SO101Follower(Robot):
                 self.bus.write("I_Coefficient", motor, 0)
                 self.bus.write("D_Coefficient", motor, 32)
 
+        # Verify torque is enabled after exiting context
+        torque_status = self.bus.sync_read("Torque_Enable")
+        logger.info(f"TORQUE_STATUS after configure: {torque_status}")
+
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
@@ -209,7 +213,13 @@ class SO101Follower(Robot):
             goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
 
         # Send goal position to the arm
+        logger.info(f"SYNC_WRITE Goal_Position: {goal_pos}")
         self.bus.sync_write("Goal_Position", goal_pos)
+
+        # Verify motors reached their targets (read back Goal_Position register)
+        goal_readback = self.bus.sync_read("Goal_Position")
+        logger.info(f"GOAL_READBACK: {goal_readback}")
+
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
     def disconnect(self):
