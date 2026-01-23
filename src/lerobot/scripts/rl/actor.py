@@ -536,6 +536,7 @@ def act_with_policy(
     # Add counters for intervention rate calculation
     episode_intervention_steps = 0
     episode_total_steps = 0
+    num_episodes = 0
 
     policy_timer = TimerManager("Policy inference", log=False)
 
@@ -607,7 +608,8 @@ def act_with_policy(
             obs = next_obs_stacked
 
             if done or truncated:
-                logging.info(f"[ACTOR] Global step {interaction_step}: Episode reward: {sum_reward_episode}")
+                num_episodes += 1
+                logging.info(f"[ACTOR] Episode {num_episodes} done | step={interaction_step} | reward={sum_reward_episode:.2f}")
 
                 update_policy_parameters(policy=policy, parameters_queue=parameters_queue, device=device)
 
@@ -632,6 +634,7 @@ def act_with_policy(
                         {
                             "Episodic reward": sum_reward_episode,
                             "Interaction step": interaction_step,
+                            "Episode number": num_episodes,
                             "Episode intervention": int(episode_intervention),
                             "Intervention rate": intervention_rate,
                             **stats,
