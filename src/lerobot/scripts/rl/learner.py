@@ -1436,6 +1436,13 @@ def process_interaction_message(
     # Shift interaction step for consistency with checkpointed state
     message["Interaction step"] += interaction_step_shift
 
+    # Log episode info
+    ep_num = message.get("Episode number", "?")
+    ep_reward = message.get("Episodic reward", 0)
+    int_step = message.get("Interaction step", 0)
+    int_rate = message.get("Intervention rate", 0)
+    logging.info(f"[LEARNER] Episode {ep_num} | step={int_step} | reward={ep_reward:.2f} | intervention={int_rate:.1%}")
+
     # Log if logger available
     if wandb_logger:
         wandb_logger.log_dict(d=message, mode="train", custom_step_key="Interaction step")
