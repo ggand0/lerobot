@@ -159,13 +159,14 @@ class SO101FollowerEndEffector(SO101Follower):
         # Clamp velocity
         dq_active_clamped = np.clip(dq_active, -self.config.ik_max_dq, self.config.ik_max_dq)
 
-        # Detailed IK logging to diagnose joint movement issues
-        logger.info(
-            f"IK_DEBUG: pos_error={pos_error}, active_joints={active_joints}, "
-            f"Jacobian_norms=[{', '.join([f'j{active_joints[i]}:{np.linalg.norm(Jp[:, i]):.4f}' for i in range(n_active)])}], "
-            f"dq_rad=[{', '.join([f'j{active_joints[i]}:{dq_active[i]:.4f}' for i in range(n_active)])}], "
-            f"dq_deg=[{', '.join([f'j{active_joints[i]}:{np.rad2deg(dq_active_clamped[i]):.2f}' for i in range(n_active)])}]"
-        )
+        # Detailed IK logging (debug only)
+        if self.config.debug_ik:
+            logger.info(
+                f"IK_DEBUG: pos_error={pos_error}, active_joints={active_joints}, "
+                f"Jacobian_norms=[{', '.join([f'j{active_joints[i]}:{np.linalg.norm(Jp[:, i]):.4f}' for i in range(n_active)])}], "
+                f"dq_rad=[{', '.join([f'j{active_joints[i]}:{dq_active[i]:.4f}' for i in range(n_active)])}], "
+                f"dq_deg=[{', '.join([f'j{active_joints[i]}:{np.rad2deg(dq_active_clamped[i]):.2f}' for i in range(n_active)])}]"
+            )
 
         # Build target joint positions
         target_joints = current_joints_rad.copy()
@@ -246,9 +247,10 @@ class SO101FollowerEndEffector(SO101Follower):
                 self.end_effector_bounds["min"],
                 self.end_effector_bounds["max"],
             )
-            ee_clipped = target_ee_pos - target_ee_pos_unclamped
-            if np.any(np.abs(ee_clipped) > 0.001):
-                logger.warning(f"EE BOUNDS CLIPPING: clipped by {ee_clipped}m, bounds={self.end_effector_bounds}")
+            if self.config.debug_ik:
+                ee_clipped = target_ee_pos - target_ee_pos_unclamped
+                if np.any(np.abs(ee_clipped) > 0.001):
+                    logger.warning(f"EE BOUNDS CLIPPING: clipped by {ee_clipped}m, bounds={self.end_effector_bounds}")
 
         # Compute IK to get target joint positions (radians)
         target_joints_rad = self._compute_ik(target_ee_pos, current_joints_rad)
@@ -270,14 +272,15 @@ class SO101FollowerEndEffector(SO101Follower):
             f"{name}.pos": target_joints_deg[i] for i, name in enumerate(self.JOINT_NAMES)
         }
 
-        # Debug logging to verify all joints are being commanded
-        joint_deltas_deg = target_joints_deg - current_joints_deg
-        logger.info(
-            f"SEND_ACTION: action={action[:3]}, delta_xyz_scaled={delta_xyz}, "
-            f"current_ee={current_ee_pos}, target_ee={target_ee_pos}, "
-            f"current_joints_deg={current_joints_deg}, target_joints_deg={target_joints_deg}, "
-            f"joint_deltas_deg={joint_deltas_deg}"
-        )
+        # Debug logging (optional)
+        if self.config.debug_ik:
+            joint_deltas_deg = target_joints_deg - current_joints_deg
+            logger.info(
+                f"SEND_ACTION: action={action[:3]}, delta_xyz_scaled={delta_xyz}, "
+                f"current_ee={current_ee_pos}, target_ee={target_ee_pos}, "
+                f"current_joints_deg={current_joints_deg}, target_joints_deg={target_joints_deg}, "
+                f"joint_deltas_deg={joint_deltas_deg}"
+            )
 
         # Handle gripper (action in [0, 2] where 1 = no-op)
         current_gripper = current_pos_dict["gripper"]
