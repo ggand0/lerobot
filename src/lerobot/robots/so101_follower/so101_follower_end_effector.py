@@ -103,6 +103,7 @@ class SO101FollowerEndEffector(SO101Follower):
         logger.info(f"EE site: {self.config.end_effector_site} (id={self.ee_site_id})")
         logger.info(f"Locked joints: {self.config.locked_joints}")
         logger.info(f"Locked joint positions: {getattr(self.config, 'locked_joint_positions', {})}")
+        logger.info(f"Joint limits (deg): lower={np.rad2deg(self.joint_limits_lower)}, upper={np.rad2deg(self.joint_limits_upper)}")
 
     def _sync_mujoco(self, joint_positions_rad: np.ndarray):
         """Sync MuJoCo model state with joint positions (radians)."""
@@ -156,15 +157,16 @@ class SO101FollowerEndEffector(SO101Follower):
             dq_active = np.linalg.pinv(Jp) @ pos_error
 
         # Clamp velocity
-        dq_active = np.clip(dq_active, -self.config.ik_max_dq, self.config.ik_max_dq)
+        dq_active_clamped = np.clip(dq_active, -self.config.ik_max_dq, self.config.ik_max_dq)
 
         # Build target joint positions
         target_joints = current_joints_rad.copy()
         for i, joint_idx in enumerate(active_joints):
-            target_joints[joint_idx] += dq_active[i]
+            target_joints[joint_idx] += dq_active_clamped[i]
 
-        # Clamp to joint limits
-        target_joints = np.clip(target_joints, self.joint_limits_lower, self.joint_limits_upper)
+        # Note: We do NOT clamp to MuJoCo joint limits for the real robot.
+        # MuJoCo limits are for simulation; the real robot has its own hardware limits.
+        # Clamping here would artificially restrict the robot's range of motion.
 
         return target_joints
 
@@ -226,15 +228,19 @@ class SO101FollowerEndEffector(SO101Follower):
 
         # Compute target EE position
         delta_xyz = action[:3] * self.config.action_scale
-        target_ee_pos = current_ee_pos + delta_xyz
+        target_ee_pos_unclamped = current_ee_pos + delta_xyz
 
         # Apply bounds
+        target_ee_pos = target_ee_pos_unclamped.copy()
         if self.end_effector_bounds is not None:
             target_ee_pos = np.clip(
                 target_ee_pos,
                 self.end_effector_bounds["min"],
                 self.end_effector_bounds["max"],
             )
+            ee_clipped = target_ee_pos - target_ee_pos_unclamped
+            if np.any(np.abs(ee_clipped) > 0.001):
+                logger.warning(f"EE BOUNDS CLIPPING: clipped by {ee_clipped}m, bounds={self.end_effector_bounds}")
 
         # Compute IK to get target joint positions (radians)
         target_joints_rad = self._compute_ik(target_ee_pos, current_joints_rad)
@@ -255,6 +261,15 @@ class SO101FollowerEndEffector(SO101Follower):
         joint_action = {
             f"{name}.pos": target_joints_deg[i] for i, name in enumerate(self.JOINT_NAMES)
         }
+
+        # Debug logging to verify all joints are being commanded
+        joint_deltas_deg = target_joints_deg - current_joints_deg
+        logger.info(
+            f"SEND_ACTION: action={action[:3]}, delta_xyz_scaled={delta_xyz}, "
+            f"current_ee={current_ee_pos}, target_ee={target_ee_pos}, "
+            f"current_joints_deg={current_joints_deg}, target_joints_deg={target_joints_deg}, "
+            f"joint_deltas_deg={joint_deltas_deg}"
+        )
 
         # Handle gripper (action in [0, 2] where 1 = no-op)
         current_gripper = current_pos_dict["gripper"]
@@ -279,17 +294,37 @@ class SO101FollowerEndEffector(SO101Follower):
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
 
-        # Capture images from cameras
+        # Capture images from cameras with retry logic
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            try:
-                obs_dict[cam_key] = cam.async_read()
-            except TimeoutError as e:
-                logger.error(f"Camera {cam_key} timeout - USB may need reset. Unplug and replug the camera.")
+            max_retries = 5
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    obs_dict[cam_key] = cam.async_read()
+                    break
+                except TimeoutError as e:
+                    last_error = e
+                    logger.warning(f"Camera {cam_key} timeout attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        # Try to recover camera
+                        time.sleep(0.2 * (attempt + 1))
+                        try:
+                            # Attempt to restart async read thread
+                            if hasattr(cam, '_read_thread') and cam._read_thread is not None:
+                                if not cam._read_thread.is_alive():
+                                    logger.warning(f"Camera {cam_key} read thread dead, reconnecting...")
+                                    cam.disconnect()
+                                    time.sleep(0.5)
+                                    cam.connect()
+                        except Exception as reconnect_err:
+                            logger.warning(f"Camera reconnect failed: {reconnect_err}")
+            else:
+                logger.error(f"Camera {cam_key} timeout after {max_retries} attempts - USB may need reset.")
                 raise RuntimeError(
-                    f"Camera {cam_key} stopped responding. "
+                    f"Camera {cam_key} stopped responding after {max_retries} retries. "
                     f"Please unplug and replug the USB camera, then restart."
-                ) from e
+                ) from last_error
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
 
