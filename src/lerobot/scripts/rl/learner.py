@@ -1117,6 +1117,7 @@ def initialize_replay_buffer(
         dataset = LeRobotDataset(
             repo_id=repo_id,
             root=dataset_path,
+            video_backend=cfg.dataset.video_backend if cfg.dataset else "pyav",
         )
         return ReplayBuffer.from_lerobot_dataset(
             lerobot_dataset=dataset,

@@ -159,6 +159,14 @@ class SO101FollowerEndEffector(SO101Follower):
         # Clamp velocity
         dq_active_clamped = np.clip(dq_active, -self.config.ik_max_dq, self.config.ik_max_dq)
 
+        # Detailed IK logging to diagnose joint movement issues
+        logger.info(
+            f"IK_DEBUG: pos_error={pos_error}, active_joints={active_joints}, "
+            f"Jacobian_norms=[{', '.join([f'j{active_joints[i]}:{np.linalg.norm(Jp[:, i]):.4f}' for i in range(n_active)])}], "
+            f"dq_rad=[{', '.join([f'j{active_joints[i]}:{dq_active[i]:.4f}' for i in range(n_active)])}], "
+            f"dq_deg=[{', '.join([f'j{active_joints[i]}:{np.rad2deg(dq_active_clamped[i]):.2f}' for i in range(n_active)])}]"
+        )
+
         # Build target joint positions
         target_joints = current_joints_rad.copy()
         for i, joint_idx in enumerate(active_joints):
