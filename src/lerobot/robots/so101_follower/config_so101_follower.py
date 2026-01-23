@@ -78,6 +78,9 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
     # Action scale: meters per action unit (same as sim training)
     action_scale: float = 0.02
 
+    # Enable verbose debug logging for IK, torque, and motor commands
+    debug_ik: bool = False
+
     def __post_init__(self):
         # Set defaults for fields that use None to work around draccus default_factory issues
         if self.locked_joints is None:
