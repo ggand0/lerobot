@@ -1335,18 +1335,18 @@ class ResetWrapper(gym.Wrapper):
             # Use current position as home - no reset motion needed
             logging.info("Using current position as home (no reset motion)")
         elif reset_pose is not None:
-            log_say("Reset the environment.", play_sounds=False)
+            log_say(f"Resetting. {int(self.reset_time_s)} seconds.", play_sounds=True)
             reset_follower_position(self.unwrapped.robot, reset_pose)
-            log_say("Reset the environment done.", play_sounds=False)
+            busy_wait(self.reset_time_s)
+            log_say("Reset done.", play_sounds=True)
 
             if hasattr(self.env, "robot_leader"):
                 # Disable torque on leader so user can move it freely
                 self.env.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
-                log_say("Leader arm free.", play_sounds=False)
         else:
             log_say(
-                f"Manually reset the environment for {self.reset_time_s} seconds.",
-                play_sounds=False,
+                f"Reset environment. {int(self.reset_time_s)} seconds.",
+                play_sounds=True,
             )
             start_time = time.perf_counter()
             while time.perf_counter() - start_time < self.reset_time_s:
@@ -1361,7 +1361,7 @@ class ResetWrapper(gym.Wrapper):
                     action = self.env.robot_leader.get_action()
                     self.unwrapped.robot.send_action(action)
 
-            log_say("Manual reset of the environment done.", play_sounds=False)
+            log_say("Reset done.", play_sounds=True)
 
         busy_wait(self.reset_time_s - (time.perf_counter() - start_time))
 
@@ -3098,10 +3098,6 @@ def record_dataset(env, policy, cfg):
 
         dataset.save_episode()
         episode_index += 1
-
-        # Wait for environment reset before next episode
-        log_say("Resetting environment", play_sounds=True)
-        busy_wait(5.0)
 
     # Finalize dataset
     # dataset.consolidate(run_compute_stats=True)
