@@ -176,6 +176,7 @@ class EnvTransformConfig:
     # ee_action_space_params: EEActionSpaceConfig = field(default_factory=EEActionSpaceConfig)
     control_mode: str = "gamepad"
     display_cameras: bool = False
+    display_reward_preview: bool = False  # Show reward classifier overlay during training
     add_joint_velocity_to_observation: bool = False
     add_current_to_observation: bool = False
     add_ee_pose_to_observation: bool = False

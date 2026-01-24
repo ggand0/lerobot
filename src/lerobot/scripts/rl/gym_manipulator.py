@@ -739,7 +739,7 @@ class RewardWrapper(gym.Wrapper):
         self.success_streak = 0
         self.display_reward = display_reward
         self.last_reward_prob = 0.0
-        self.reward_threshold = 0.85
+        self.reward_threshold = 0.7
 
         self.reward_classifier = torch.compile(reward_classifier)
         self.reward_classifier.to(self.device)
@@ -800,38 +800,28 @@ class RewardWrapper(gym.Wrapper):
     def _overlay_reward_on_preview(self, observation):
         """Overlay reward probability on the camera preview."""
         import cv2
-
-        for key in observation:
-            if "image" in key:
-                img = observation[key]
-                if hasattr(img, 'cpu'):
-                    img_np = img.cpu().numpy()
-                elif hasattr(img, 'numpy'):
-                    img_np = img.numpy()
-                else:
-                    img_np = img
-
-                # Convert to BGR for cv2
-                if img_np.dtype != np.uint8:
-                    img_np = (img_np * 255).astype(np.uint8)
-                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-                # Draw reward probability
-                prob_text = f"R: {self.last_reward_prob:.2f}"
-                color = (0, 255, 0) if self.last_reward_prob >= self.reward_threshold else (0, 165, 255)
-                cv2.putText(img_bgr, prob_text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-                # Draw success streak
-                streak_text = f"Streak: {self.success_streak}/{self.consecutive_success_frames}"
-                streak_color = (0, 255, 0) if self.success_streak >= self.consecutive_success_frames else (255, 255, 255)
-                cv2.putText(img_bgr, streak_text, (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, streak_color, 2)
-
-                # Draw step count and min steps
-                step_text = f"S: {self.current_step}/{self.min_steps_before_success}"
-                cv2.putText(img_bgr, step_text, (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-
-                cv2.imshow(f"{key}_reward", img_bgr)
-                cv2.waitKey(1)
+        try:
+            for key in observation:
+                if "image" in key:
+                    img = observation[key]
+                    while img.dim() > 3:
+                        img = img[0]
+                    img_np = img.cpu().numpy().transpose(1, 2, 0).copy()
+                    if img_np.max() > 2.0:
+                        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+                    else:
+                        img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
+                    img_bgr = cv2.cvtColor(cv2.resize(img_np, (384, 384)), cv2.COLOR_RGB2BGR)
+                    prob = self.last_reward_prob
+                    color = (0, 255, 0) if prob >= self.reward_threshold else (0, 0, 255)
+                    cv2.rectangle(img_bgr, (10, 10), (190, 35), (50, 50, 50), -1)
+                    cv2.rectangle(img_bgr, (10, 10), (10 + int(180 * prob), 35), color, -1)
+                    cv2.putText(img_bgr, f"{prob:.1%}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.imshow("Reward", img_bgr)
+                    cv2.waitKey(1)
+                    break
+        except Exception:
+            pass
 
     def reset(self, seed=None, options=None):
         """Reset the environment and step counter."""
@@ -922,6 +912,7 @@ class ImageCropResizeWrapper(gym.Wrapper):
         env,
         crop_params_dict: dict[str, Annotated[tuple[int], 4]],
         resize_size=None,
+        normalize_images: bool = True,
     ):
         """
         Initialize the image crop and resize wrapper.
@@ -931,10 +922,13 @@ class ImageCropResizeWrapper(gym.Wrapper):
             crop_params_dict: Dictionary mapping image observation keys to crop parameters
                              (top, left, height, width).
             resize_size: Target size for resized images (height, width). Defaults to (128, 128).
+            normalize_images: If True, images are [0, 1]. If False, images are [0, 255].
         """
         super().__init__(env)
         self.env = env
         self.crop_params_dict = crop_params_dict
+        self.normalize_images = normalize_images
+        self.clamp_max = 1.0 if normalize_images else 255.0
         print(f"obs_keys , {self.env.observation_space}")
         print(f"crop params dict {crop_params_dict.keys()}")
         for key_crop in crop_params_dict:
@@ -942,7 +936,8 @@ class ImageCropResizeWrapper(gym.Wrapper):
                 raise ValueError(f"Key {key_crop} not in observation space")
         for key in crop_params_dict:
             new_shape = (3, resize_size[0], resize_size[1])
-            self.observation_space[key] = gym.spaces.Box(low=0, high=255, shape=new_shape)
+            high = 1.0 if normalize_images else 255.0
+            self.observation_space[key] = gym.spaces.Box(low=0, high=high, shape=new_shape)
 
         self.resize_size = resize_size
         if self.resize_size is None:
@@ -981,8 +976,7 @@ class ImageCropResizeWrapper(gym.Wrapper):
 
             obs[k] = F.crop(obs[k], *self.crop_params_dict[k])
             obs[k] = F.resize(obs[k], self.resize_size)
-            # TODO (michel-aractingi): Bug in resize, it returns values outside [0, 1]
-            obs[k] = obs[k].clamp(0.0, 1.0)
+            obs[k] = obs[k].clamp(0.0, self.clamp_max)
             obs[k] = obs[k].to(device)
 
         return obs, reward, terminated, truncated, info
@@ -1005,7 +999,7 @@ class ImageCropResizeWrapper(gym.Wrapper):
                 obs[k] = obs[k].cpu()
             obs[k] = F.crop(obs[k], *self.crop_params_dict[k])
             obs[k] = F.resize(obs[k], self.resize_size)
-            obs[k] = obs[k].clamp(0.0, 1.0)
+            obs[k] = obs[k].clamp(0.0, self.clamp_max)
             obs[k] = obs[k].to(device)
         return obs, info
 
@@ -2801,6 +2795,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
             env=env,
             crop_params_dict=cfg.wrapper.crop_params_dict,
             resize_size=cfg.wrapper.resize_size,
+            normalize_images=normalize_images,
         )
     elif cfg.wrapper and cfg.wrapper.resize_size is not None:
         # Resize without cropping
@@ -2809,7 +2804,7 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     # Add reward computation and control wrappers
     reward_classifier = init_reward_classifier(cfg)
     if reward_classifier is not None:
-        display_reward = cfg.wrapper.display_cameras if cfg.wrapper else False
+        display_reward = getattr(cfg.wrapper, 'display_reward_preview', False) if cfg.wrapper else False
         env = RewardWrapper(env=env, reward_classifier=reward_classifier, device=cfg.device, display_reward=display_reward)
 
     env = TimeLimitWrapper(env=env, control_time_s=cfg.wrapper.control_time_s, fps=cfg.fps)
