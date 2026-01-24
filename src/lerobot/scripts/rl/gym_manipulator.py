@@ -146,12 +146,13 @@ def _clamp_degrees(joints_deg: np.ndarray) -> np.ndarray:
     return clamped
 
 
-def _robust_sync_read(bus, data_name: str, max_attempts: int = 5, delay_between_attempts: float = 0.1):
+def _robust_sync_read(bus, data_name: str, max_attempts: int = 10, delay_between_attempts: float = 0.2):
     """
     Robust sync_read with delays between retries and port recovery.
 
     When USB connection drops, immediate retries fail. This function adds delays
     between attempts and tries to recover by clearing/flushing the port.
+    Uses exponential backoff and attempts port reconnection on repeated failures.
     """
     last_error = None
     for attempt in range(max_attempts):
@@ -161,20 +162,30 @@ def _robust_sync_read(bus, data_name: str, max_attempts: int = 5, delay_between_
         except ConnectionError as e:
             last_error = e
             if attempt < max_attempts - 1:
-                logging.warning(f"sync_read attempt {attempt + 1}/{max_attempts} failed, waiting {delay_between_attempts}s...")
-                time.sleep(delay_between_attempts)
+                # Exponential backoff: 0.2, 0.4, 0.8, ... capped at 1.0s
+                delay = min(delay_between_attempts * (2 ** attempt), 1.0)
+                logging.warning(f"sync_read attempt {attempt + 1}/{max_attempts} failed, waiting {delay:.2f}s...")
+                time.sleep(delay)
                 # Try to clear any pending data in the serial buffer
                 try:
                     if hasattr(bus, 'port_handler') and bus.port_handler is not None:
                         bus.port_handler.clearPort()
-                except Exception:
-                    pass
+                        # On 5th+ attempt, try to close and reopen the port
+                        if attempt >= 4:
+                            logging.warning("Attempting USB port reconnection...")
+                            bus.port_handler.closePort()
+                            time.sleep(0.5)
+                            bus.port_handler.openPort()
+                            bus.port_handler.setBaudRate(bus.port_handler.getBaudRate())
+                except Exception as reconnect_err:
+                    logging.warning(f"Port recovery failed: {reconnect_err}")
     raise last_error
 
 
-def _robust_sync_write(bus, data_name: str, values, max_attempts: int = 5, delay_between_attempts: float = 0.1):
+def _robust_sync_write(bus, data_name: str, values, max_attempts: int = 10, delay_between_attempts: float = 0.2):
     """
     Robust sync_write with delays between retries and port recovery.
+    Uses exponential backoff and attempts port reconnection on repeated failures.
     """
     last_error = None
     for attempt in range(max_attempts):
@@ -183,13 +194,22 @@ def _robust_sync_write(bus, data_name: str, values, max_attempts: int = 5, delay
         except ConnectionError as e:
             last_error = e
             if attempt < max_attempts - 1:
-                logging.warning(f"sync_write attempt {attempt + 1}/{max_attempts} failed, waiting {delay_between_attempts}s...")
-                time.sleep(delay_between_attempts)
+                # Exponential backoff: 0.2, 0.4, 0.8, ... capped at 1.0s
+                delay = min(delay_between_attempts * (2 ** attempt), 1.0)
+                logging.warning(f"sync_write attempt {attempt + 1}/{max_attempts} failed, waiting {delay:.2f}s...")
+                time.sleep(delay)
                 try:
                     if hasattr(bus, 'port_handler') and bus.port_handler is not None:
                         bus.port_handler.clearPort()
-                except Exception:
-                    pass
+                        # On 5th+ attempt, try to close and reopen the port
+                        if attempt >= 4:
+                            logging.warning("Attempting USB port reconnection...")
+                            bus.port_handler.closePort()
+                            time.sleep(0.5)
+                            bus.port_handler.openPort()
+                            bus.port_handler.setBaudRate(bus.port_handler.getBaudRate())
+                except Exception as reconnect_err:
+                    logging.warning(f"Port recovery failed: {reconnect_err}")
     raise last_error
 
 
@@ -567,7 +587,9 @@ class RobotEnv(gym.Env):
         image_keys = [key for key in self.current_observation if "image" in key]
 
         for key in image_keys:
-            cv2.imshow(key, cv2.cvtColor(self.current_observation[key].numpy(), cv2.COLOR_RGB2BGR))
+            img = self.current_observation[key]
+            img_np = img.cpu().numpy() if hasattr(img, 'cpu') else img.numpy()
+            cv2.imshow(key, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
             cv2.waitKey(1)
 
     def close(self):
@@ -695,7 +717,8 @@ class AddCurrentToObservation(gym.ObservationWrapper):
 
 
 class RewardWrapper(gym.Wrapper):
-    def __init__(self, env, reward_classifier, device="cuda", min_steps_before_success=50):
+    def __init__(self, env, reward_classifier, device="cuda", min_steps_before_success=65,
+                 consecutive_success_frames=10, display_reward=True):
         """
         Wrapper to add reward prediction to the environment using a trained classifier.
 
@@ -704,12 +727,19 @@ class RewardWrapper(gym.Wrapper):
             reward_classifier: The reward classifier model.
             device: The device to run the model on.
             min_steps_before_success: Minimum steps before allowing success termination.
+            consecutive_success_frames: Number of consecutive success frames required to terminate.
+            display_reward: If True, overlay reward probability on camera preview.
         """
         self.env = env
 
         self.device = device
         self.min_steps_before_success = min_steps_before_success
+        self.consecutive_success_frames = consecutive_success_frames
         self.current_step = 0
+        self.success_streak = 0
+        self.display_reward = display_reward
+        self.last_reward_prob = 0.0
+        self.reward_threshold = 0.85
 
         self.reward_classifier = torch.compile(reward_classifier)
         self.reward_classifier.to(self.device)
@@ -736,25 +766,78 @@ class RewardWrapper(gym.Wrapper):
 
         start_time = time.perf_counter()
         with torch.inference_mode():
-            success = (
-                self.reward_classifier.predict_reward(images, threshold=0.7)
-                if self.reward_classifier is not None
-                else 0.0
-            )
+            if self.reward_classifier is not None:
+                success = self.reward_classifier.predict_reward(images, threshold=self.reward_threshold)
+                # Get raw probability for display
+                normalized_images = self.reward_classifier.normalize_inputs(images)
+                image_list = [normalized_images[key] for key in self.reward_classifier.config.input_features
+                             if key.startswith("observation.image")]
+                probs = self.reward_classifier.predict(image_list).probabilities
+                self.last_reward_prob = probs.item() if probs.numel() == 1 else probs[0].item()
+            else:
+                success = 0.0
+                self.last_reward_prob = 0.0
         info["Reward classifier frequency"] = 1 / (time.perf_counter() - start_time)
+        info["reward_probability"] = self.last_reward_prob
 
         reward = 0.0
         if success == 1.0:
             reward = 1.0
-            # Only terminate on success after minimum steps
-            if self.current_step >= self.min_steps_before_success:
+            self.success_streak += 1
+            # Only terminate after N consecutive success frames AND minimum steps
+            if self.current_step >= self.min_steps_before_success and self.success_streak >= self.consecutive_success_frames:
                 terminated = True
+                logging.info(f"Success! {self.consecutive_success_frames} consecutive frames above threshold")
+        else:
+            self.success_streak = 0
+
+        # Overlay reward on preview if enabled
+        if self.display_reward:
+            self._overlay_reward_on_preview(observation)
 
         return observation, reward, terminated, truncated, info
+
+    def _overlay_reward_on_preview(self, observation):
+        """Overlay reward probability on the camera preview."""
+        import cv2
+
+        for key in observation:
+            if "image" in key:
+                img = observation[key]
+                if hasattr(img, 'cpu'):
+                    img_np = img.cpu().numpy()
+                elif hasattr(img, 'numpy'):
+                    img_np = img.numpy()
+                else:
+                    img_np = img
+
+                # Convert to BGR for cv2
+                if img_np.dtype != np.uint8:
+                    img_np = (img_np * 255).astype(np.uint8)
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+
+                # Draw reward probability
+                prob_text = f"R: {self.last_reward_prob:.2f}"
+                color = (0, 255, 0) if self.last_reward_prob >= self.reward_threshold else (0, 165, 255)
+                cv2.putText(img_bgr, prob_text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # Draw success streak
+                streak_text = f"Streak: {self.success_streak}/{self.consecutive_success_frames}"
+                streak_color = (0, 255, 0) if self.success_streak >= self.consecutive_success_frames else (255, 255, 255)
+                cv2.putText(img_bgr, streak_text, (5, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, streak_color, 2)
+
+                # Draw step count and min steps
+                step_text = f"S: {self.current_step}/{self.min_steps_before_success}"
+                cv2.putText(img_bgr, step_text, (5, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+                cv2.imshow(f"{key}_reward", img_bgr)
+                cv2.waitKey(1)
 
     def reset(self, seed=None, options=None):
         """Reset the environment and step counter."""
         self.current_step = 0
+        self.success_streak = 0
+        self.last_reward_prob = 0.0
         return self.env.reset(seed=seed, options=options)
 
 
@@ -2726,7 +2809,8 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     # Add reward computation and control wrappers
     reward_classifier = init_reward_classifier(cfg)
     if reward_classifier is not None:
-        env = RewardWrapper(env=env, reward_classifier=reward_classifier, device=cfg.device)
+        display_reward = cfg.wrapper.display_cameras if cfg.wrapper else False
+        env = RewardWrapper(env=env, reward_classifier=reward_classifier, device=cfg.device, display_reward=display_reward)
 
     env = TimeLimitWrapper(env=env, control_time_s=cfg.wrapper.control_time_s, fps=cfg.fps)
     if cfg.wrapper.use_gripper and cfg.wrapper.gripper_penalty is not None:
@@ -3014,6 +3098,10 @@ def record_dataset(env, policy, cfg):
 
         dataset.save_episode()
         episode_index += 1
+
+        # Wait for environment reset before next episode
+        log_say("Resetting environment", play_sounds=True)
+        busy_wait(5.0)
 
     # Finalize dataset
     # dataset.consolidate(run_compute_stats=True)
