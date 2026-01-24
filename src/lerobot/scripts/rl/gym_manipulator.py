@@ -235,6 +235,36 @@ def reset_follower_position(robot_arm, target_position):
     logging.info(f"reset_follower_position: final={final_pos}, diff={np.abs(final_pos - target_position).max():.2f}")
 
 
+def reset_leader_position(leader_arm, target_position):
+    """Reset leader arm to match follower reset position."""
+    # Enable torque on leader
+    leader_arm.bus.sync_write("Torque_Enable", 1, num_retry=3)
+    busy_wait(0.1)
+
+    current_position_dict = leader_arm.bus.sync_read("Present_Position", num_retry=3)
+    current_position = np.array(
+        [current_position_dict[name] for name in current_position_dict], dtype=np.float32
+    )
+    logging.info(f"reset_leader_position: current={current_position}, target={target_position}")
+
+    # Slow movement to target
+    trajectory = torch.from_numpy(
+        np.linspace(current_position, target_position, 100)
+    )
+    for pose in trajectory:
+        action_dict = dict(zip(current_position_dict, pose, strict=False))
+        leader_arm.bus.sync_write("Goal_Position", action_dict, num_retry=3)
+        busy_wait(0.02)
+    busy_wait(0.3)
+
+    # Disable torque so user can move leader freely
+    leader_arm.bus.sync_write("Torque_Enable", 0, num_retry=3)
+
+    final_pos_dict = leader_arm.bus.sync_read("Present_Position", num_retry=3)
+    final_pos = np.array([final_pos_dict[name] for name in final_pos_dict], dtype=np.float32)
+    logging.info(f"reset_leader_position: final={final_pos}, diff={np.abs(final_pos - target_position).max():.2f}")
+
+
 class TorchBox(gym.spaces.Box):
     """
     A version of gym.spaces.Box that handles PyTorch tensors.
@@ -584,13 +614,13 @@ class RobotEnv(gym.Env):
         """
         import cv2
 
-        image_keys = [key for key in self.current_observation if "image" in key]
-
-        for key in image_keys:
-            img = self.current_observation[key]
-            img_np = img.cpu().numpy() if hasattr(img, 'cpu') else img.numpy()
-            cv2.imshow(key, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
-            cv2.waitKey(1)
+        if "pixels" in self.current_observation:
+            for cam_name, img in self.current_observation["pixels"].items():
+                img_np = img.cpu().numpy() if hasattr(img, 'cpu') else np.asarray(img)
+                if img_np.dtype != np.uint8:
+                    img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+                cv2.imshow(cam_name, cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR))
+        cv2.waitKey(1)
 
     def close(self):
         """
@@ -1331,12 +1361,13 @@ class ResetWrapper(gym.Wrapper):
         elif reset_pose is not None:
             log_say(f"Resetting. {int(self.reset_time_s)} seconds.", play_sounds=True)
             reset_follower_position(self.unwrapped.robot, reset_pose)
+
+            # Also reset leader arm to match follower position
+            if hasattr(self.env, "robot_leader"):
+                reset_leader_position(self.env.robot_leader, reset_pose)
+
             busy_wait(self.reset_time_s)
             log_say("Reset done.", play_sounds=True)
-
-            if hasattr(self.env, "robot_leader"):
-                # Disable torque on leader so user can move it freely
-                self.env.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
         else:
             log_say(
                 f"Reset environment. {int(self.reset_time_s)} seconds.",
