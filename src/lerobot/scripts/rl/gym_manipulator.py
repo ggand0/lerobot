@@ -814,15 +814,16 @@ class RewardWrapper(gym.Wrapper):
         info["Reward classifier frequency"] = 1 / (time.perf_counter() - start_time)
         info["reward_probability"] = self.last_reward_prob
 
-        reward = 0.0
+        # HIL-SERL reward: +10 on success, -0.05 step penalty otherwise
         if success == 1.0:
-            reward = 1.0
+            reward = 10.0
             self.success_streak += 1
             # Only terminate after N consecutive success frames AND minimum steps
             if self.current_step >= self.min_steps_before_success and self.success_streak >= self.consecutive_success_frames:
                 terminated = True
                 logging.info(f"Success! {self.consecutive_success_frames} consecutive frames above threshold")
         else:
+            reward = -0.05  # Step penalty encourages faster task completion
             self.success_streak = 0
 
         # Overlay reward on preview if enabled
