@@ -748,7 +748,7 @@ class AddCurrentToObservation(gym.ObservationWrapper):
 
 class RewardWrapper(gym.Wrapper):
     def __init__(self, env, reward_classifier, device="cuda", min_steps_before_success=65,
-                 consecutive_success_frames=10, display_reward=True):
+                 consecutive_success_frames=10, display_reward=True, preview_queue=None):
         """
         Wrapper to add reward prediction to the environment using a trained classifier.
 
@@ -759,6 +759,7 @@ class RewardWrapper(gym.Wrapper):
             min_steps_before_success: Minimum steps before allowing success termination.
             consecutive_success_frames: Number of consecutive success frames required to terminate.
             display_reward: If True, overlay reward probability on camera preview.
+            preview_queue: Queue for sending frames to preview process (created before camera starts).
         """
         self.env = env
 
@@ -773,6 +774,9 @@ class RewardWrapper(gym.Wrapper):
 
         self.reward_classifier = torch.compile(reward_classifier)
         self.reward_classifier.to(self.device)
+
+        # Preview queue passed from make_robot_env (started before camera)
+        self._preview_queue = preview_queue
 
     def step(self, action):
         """
@@ -828,9 +832,11 @@ class RewardWrapper(gym.Wrapper):
         return observation, reward, terminated, truncated, info
 
     def _overlay_reward_on_preview(self, observation):
-        """Overlay reward probability on the camera preview."""
-        import cv2
+        """Overlay reward probability on the camera preview using separate process."""
         try:
+            if self._preview_queue is None:
+                return
+
             for key in observation:
                 if "image" in key:
                     img = observation[key]
@@ -841,14 +847,17 @@ class RewardWrapper(gym.Wrapper):
                         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
                     else:
                         img_np = np.clip(img_np * 255, 0, 255).astype(np.uint8)
-                    img_bgr = cv2.cvtColor(cv2.resize(img_np, (384, 384)), cv2.COLOR_RGB2BGR)
-                    prob = self.last_reward_prob
-                    color = (0, 255, 0) if prob >= self.reward_threshold else (0, 0, 255)
-                    cv2.rectangle(img_bgr, (10, 10), (190, 35), (50, 50, 50), -1)
-                    cv2.rectangle(img_bgr, (10, 10), (10 + int(180 * prob), 35), color, -1)
-                    cv2.putText(img_bgr, f"{prob:.1%}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                    cv2.imshow("Reward", img_bgr)
-                    cv2.waitKey(1)
+
+                    # Send to preview process (non-blocking)
+                    try:
+                        # Clear old frame if queue is full
+                        try:
+                            self._preview_queue.get_nowait()
+                        except:
+                            pass
+                        self._preview_queue.put_nowait((img_np, self.last_reward_prob, self.reward_threshold))
+                    except:
+                        pass
                     break
         except Exception:
             pass
@@ -859,6 +868,25 @@ class RewardWrapper(gym.Wrapper):
         self.success_streak = 0
         self.last_reward_prob = 0.0
         return self.env.reset(seed=seed, options=options)
+
+
+def _preview_display_loop(queue):
+    """Separate process for displaying preview - completely isolated from main process."""
+    import cv2
+    cv2.namedWindow("Reward", cv2.WINDOW_NORMAL)
+    while True:
+        try:
+            img_np, prob, threshold = queue.get(timeout=1.0)
+            img_resized = cv2.resize(img_np, (384, 384))
+            img_bgr = cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR)
+            color = (0, 255, 0) if prob >= threshold else (0, 0, 255)
+            cv2.rectangle(img_bgr, (10, 10), (190, 35), (50, 50, 50), -1)
+            cv2.rectangle(img_bgr, (10, 10), (10 + int(180 * prob), 35), color, -1)
+            cv2.putText(img_bgr, f"{prob:.1%}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.imshow("Reward", img_bgr)
+            cv2.waitKey(1)
+        except:
+            cv2.waitKey(100)
 
 
 class TimeLimitWrapper(gym.Wrapper):
@@ -2787,6 +2815,18 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
 
     if cfg.robot is None:
         raise ValueError("RobotConfig (cfg.robot) must be provided for gym_manipulator environment.")
+
+    # Start preview process using spawn (not fork) to avoid lock corruption
+    preview_queue = None
+    preview_proc = None
+    display_reward = getattr(cfg.wrapper, 'display_reward_preview', False) if cfg.wrapper else False
+    if display_reward:
+        import multiprocessing as mp
+        ctx = mp.get_context('spawn')  # spawn avoids fork lock corruption
+        preview_queue = ctx.Queue(maxsize=1)
+        preview_proc = ctx.Process(target=_preview_display_loop, args=(preview_queue,), daemon=True)
+        preview_proc.start()
+
     robot = make_robot_from_config(cfg.robot)
     teleop_device = make_teleoperator_from_config(cfg.teleop)
     teleop_device.connect()
@@ -2835,8 +2875,8 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     # Add reward computation and control wrappers
     reward_classifier = init_reward_classifier(cfg)
     if reward_classifier is not None:
-        display_reward = getattr(cfg.wrapper, 'display_reward_preview', False) if cfg.wrapper else False
-        env = RewardWrapper(env=env, reward_classifier=reward_classifier, device=cfg.device, display_reward=display_reward)
+        env = RewardWrapper(env=env, reward_classifier=reward_classifier, device=cfg.device,
+                           display_reward=display_reward, preview_queue=preview_queue)
 
     env = TimeLimitWrapper(env=env, control_time_s=cfg.wrapper.control_time_s, fps=cfg.fps)
     if cfg.wrapper.use_gripper and cfg.wrapper.gripper_penalty is not None:
