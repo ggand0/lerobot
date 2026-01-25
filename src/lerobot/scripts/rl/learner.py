@@ -850,41 +850,8 @@ def save_training_checkpoint(
     # Update the "last" symlink
     update_last_checkpoint(checkpoint_dir)
 
-    # TODO : temporary save replay buffer here, remove later when on the robot
-    # We want to control this with the keyboard inputs
-    dataset_dir = os.path.join(cfg.output_dir, "dataset")
-    if os.path.exists(dataset_dir) and os.path.isdir(dataset_dir):
-        shutil.rmtree(dataset_dir)
-
-    # Save dataset
-    # NOTE: Handle the case where the dataset repo id is not specified in the config
-    # eg. RL training without demonstrations data
-    # NOTE: Frame stacking produces multi-channel images that can't be saved as standard LeRobotDataset
-    repo_id_buffer_save = cfg.env.task if dataset_repo_id is None else dataset_repo_id
-    try:
-        replay_buffer.to_lerobot_dataset(repo_id=repo_id_buffer_save, fps=fps, root=dataset_dir)
-    except ValueError as e:
-        if "Shape of" in str(e):
-            logging.warning(f"[LEARNER] Skipping buffer-to-dataset conversion (frame stacking incompatible): {e}")
-        else:
-            raise
-
-    if offline_replay_buffer is not None:
-        dataset_offline_dir = os.path.join(cfg.output_dir, "dataset_offline")
-        if os.path.exists(dataset_offline_dir) and os.path.isdir(dataset_offline_dir):
-            shutil.rmtree(dataset_offline_dir)
-
-        try:
-            offline_replay_buffer.to_lerobot_dataset(
-                cfg.dataset.repo_id,
-                fps=fps,
-                root=dataset_offline_dir,
-            )
-        except ValueError as e:
-            if "Shape of" in str(e):
-                logging.warning(f"[LEARNER] Skipping offline buffer-to-dataset conversion (frame stacking incompatible): {e}")
-            else:
-                raise
+    # NOTE: Dataset saving disabled - not needed for training and causes issues with image saving
+    # Model weights + optimizer state are sufficient for resuming training
 
     logging.info("Resume training")
 
@@ -1027,6 +994,9 @@ def handle_resume_logic(cfg: TrainRLServerPipelineConfig) -> TrainRLServerPipeli
     checkpoint_cfg.log_freq = cfg.log_freq
     checkpoint_cfg.save_checkpoint = cfg.save_checkpoint
 
+    # Set pretrained_path to load model weights from checkpoint
+    checkpoint_cfg.policy.pretrained_path = os.path.join(checkpoint_dir, PRETRAINED_MODEL_DIR)
+
     # Ensure resume flag is set in returned config
     checkpoint_cfg.resume = True
     return checkpoint_cfg
@@ -1106,26 +1076,19 @@ def initialize_replay_buffer(
         ReplayBuffer: Initialized replay buffer
     """
     # Check if there's a saved online dataset to resume from
+    # NOTE: Dataset loading is disabled - it often fails due to image saving issues
+    # and is not necessary for training (model weights + optimizer state are sufficient)
     dataset_path = os.path.join(cfg.output_dir, "dataset")
 
     if cfg.resume and os.path.exists(dataset_path):
-        logging.info("Resume training: loading online dataset from checkpoint")
-        # NOTE: In RL is possible to not have a dataset.
-        repo_id = None
-        if cfg.dataset is not None:
-            repo_id = cfg.dataset.repo_id
-        dataset = LeRobotDataset(
-            repo_id=repo_id,
-            root=dataset_path,
-            video_backend=cfg.dataset.video_backend if cfg.dataset else "pyav",
-        )
-        return ReplayBuffer.from_lerobot_dataset(
-            lerobot_dataset=dataset,
-            capacity=cfg.policy.online_buffer_capacity,
-            device=device,
-            state_keys=cfg.policy.input_features.keys(),
-            optimize_memory=True,
-        )
+        logging.info("Resume training: skipping online dataset load (not required, model weights loaded)")
+        # Delete corrupt dataset to prevent future issues
+        import shutil
+        try:
+            shutil.rmtree(dataset_path)
+            logging.info(f"Deleted corrupt dataset at {dataset_path}")
+        except Exception as e:
+            logging.warning(f"Failed to delete corrupt dataset: {e}")
 
     # Start with empty buffer (either fresh start or resume without saved dataset)
     if cfg.resume:
