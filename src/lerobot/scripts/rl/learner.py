@@ -385,7 +385,7 @@ def add_actor_information_and_train(
     optimizers, lr_scheduler = make_optimizers_and_scheduler(cfg=cfg, policy=policy)
 
     # If we are resuming, we need to load the training state
-    resume_optimization_step, resume_interaction_step = load_training_state(cfg=cfg, optimizers=optimizers)
+    resume_optimization_step, resume_interaction_step, resume_episode_number = load_training_state(cfg=cfg, optimizers=optimizers)
 
     log_training_info(cfg=cfg, policy=policy)
 
@@ -405,6 +405,7 @@ def add_actor_information_and_train(
     interaction_message = None
     optimization_step = resume_optimization_step if resume_optimization_step is not None else 0
     interaction_step_shift = resume_interaction_step if resume_interaction_step is not None else 0
+    episode_shift = resume_episode_number if resume_episode_number is not None else 0
 
     dataset_repo_id = None
     if cfg.dataset is not None:
@@ -435,6 +436,7 @@ def add_actor_information_and_train(
         interaction_message = process_interaction_messages(
             interaction_message_queue=interaction_message_queue,
             interaction_step_shift=interaction_step_shift,
+            episode_shift=episode_shift,
             wandb_logger=wandb_logger,
             shutdown_event=shutdown_event,
         )
@@ -843,10 +845,11 @@ def save_training_checkpoint(
         scheduler=None,
     )
 
-    # Save interaction step manually
+    # Save interaction step and episode number manually
     training_state_dir = os.path.join(checkpoint_dir, TRAINING_STATE_DIR)
     os.makedirs(training_state_dir, exist_ok=True)
-    training_state = {"step": optimization_step, "interaction_step": interaction_step}
+    episode_number = interaction_message.get("Episode number", 0) if interaction_message is not None else 0
+    training_state = {"step": optimization_step, "interaction_step": interaction_step, "episode_number": episode_number}
     torch.save(training_state, os.path.join(training_state_dir, "training_state.pt"))
 
     # Update the "last" symlink
@@ -1016,10 +1019,10 @@ def load_training_state(
         optimizers (Optimizer | dict): Optimizers to load state into
 
     Returns:
-        tuple: (optimization_step, interaction_step) or (None, None) if not resuming
+        tuple: (optimization_step, interaction_step, episode_number) or (None, None, None) if not resuming
     """
     if not cfg.resume:
-        return None, None
+        return None, None, None
 
     # Construct path to the last checkpoint directory
     checkpoint_dir = os.path.join(cfg.output_dir, CHECKPOINTS_DIR, LAST_CHECKPOINT_LINK)
@@ -1030,19 +1033,21 @@ def load_training_state(
         # Use the utility function from train_utils which loads the optimizer state
         step, optimizers, _ = utils_load_training_state(Path(checkpoint_dir), optimizers, None)
 
-        # Load interaction step separately from training_state.pt
+        # Load interaction step and episode number separately from training_state.pt
         training_state_path = os.path.join(checkpoint_dir, TRAINING_STATE_DIR, "training_state.pt")
         interaction_step = 0
+        episode_number = 0
         if os.path.exists(training_state_path):
             training_state = torch.load(training_state_path, weights_only=False)  # nosec B614: Safe usage of torch.load
             interaction_step = training_state.get("interaction_step", 0)
+            episode_number = training_state.get("episode_number", 0)
 
-        logging.info(f"Resuming from step {step}, interaction step {interaction_step}")
-        return step, interaction_step
+        logging.info(f"Resuming from step {step}, interaction step {interaction_step}, episode {episode_number}")
+        return step, interaction_step, episode_number
 
     except Exception as e:
         logging.error(f"Failed to load training state: {e}")
-        return None, None
+        return None, None, None
 
 
 def log_training_info(cfg: TrainRLServerPipelineConfig, policy: nn.Module) -> None:
@@ -1394,12 +1399,14 @@ def push_actor_policy_to_queue(parameters_queue: Queue, policy: nn.Module):
 
 
 def process_interaction_message(
-    message, interaction_step_shift: int, wandb_logger: WandBLogger | None = None
+    message, interaction_step_shift: int, episode_shift: int = 0, wandb_logger: WandBLogger | None = None
 ):
     """Process a single interaction message with consistent handling."""
     message = bytes_to_python_object(message)
-    # Shift interaction step for consistency with checkpointed state
+    # Shift interaction step and episode number for consistency with checkpointed state
     message["Interaction step"] += interaction_step_shift
+    if "Episode number" in message:
+        message["Episode number"] += episode_shift
 
     # Log episode info
     ep_num = message.get("Episode number", "?")
@@ -1461,6 +1468,7 @@ def process_transitions(
 def process_interaction_messages(
     interaction_message_queue: Queue,
     interaction_step_shift: int,
+    episode_shift: int,
     wandb_logger: WandBLogger | None,
     shutdown_event: any,
 ) -> dict | None:
@@ -1469,6 +1477,7 @@ def process_interaction_messages(
     Args:
         interaction_message_queue: Queue for receiving interaction messages
         interaction_step_shift: Amount to shift interaction step by
+        episode_shift: Amount to shift episode number by
         wandb_logger: Logger for tracking progress
         shutdown_event: Event to signal shutdown
 
@@ -1481,6 +1490,7 @@ def process_interaction_messages(
         last_message = process_interaction_message(
             message=message,
             interaction_step_shift=interaction_step_shift,
+            episode_shift=episode_shift,
             wandb_logger=wandb_logger,
         )
 
