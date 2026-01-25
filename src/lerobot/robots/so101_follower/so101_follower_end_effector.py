@@ -322,8 +322,8 @@ class SO101FollowerEndEffector(SO101Follower):
                         time.sleep(0.2 * (attempt + 1))
                         try:
                             # Attempt to restart async read thread
-                            if hasattr(cam, '_read_thread') and cam._read_thread is not None:
-                                if not cam._read_thread.is_alive():
+                            if hasattr(cam, 'thread') and cam.thread is not None:
+                                if not cam.thread.is_alive():
                                     logger.warning(f"Camera {cam_key} read thread dead, reconnecting...")
                                     cam.disconnect()
                                     time.sleep(0.5)
