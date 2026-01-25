@@ -2297,7 +2297,10 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         Returns:
             The initial observation and info.
         """
+        # Preserve pause_requested across resets (user toggle persists between episodes)
+        pause_requested = self.keyboard_events.get("pause_requested", False)
         self.keyboard_events = dict.fromkeys(self.keyboard_events, False)
+        self.keyboard_events["pause_requested"] = pause_requested
         self.leader_tracking_error_queue.clear()
         return super().reset(**kwargs)
 

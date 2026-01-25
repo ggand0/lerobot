@@ -653,21 +653,32 @@ def act_with_policy(
                     obs = frame_stack_buffer.reset(obs)
 
                 # Handle pause between episodes if requested via '-' key
-                # Traverse wrapper chain to find keyboard_events
+                # Use gymnasium's get_wrapper_attr to find keyboard_events in wrapper chain
                 keyboard_events = None
-                env = online_env
-                while env is not None:
-                    if hasattr(env, 'keyboard_events'):
-                        keyboard_events = env.keyboard_events
-                        break
-                    env = getattr(env, 'env', None)
+                try:
+                    keyboard_events = online_env.get_wrapper_attr('keyboard_events')
+                    logging.debug(f"[ACTOR] Found keyboard_events via get_wrapper_attr: {keyboard_events}")
+                except AttributeError:
+                    # Fallback: manually traverse wrapper chain
+                    env = online_env
+                    while env is not None:
+                        if hasattr(env, 'keyboard_events'):
+                            keyboard_events = env.keyboard_events
+                            logging.debug(f"[ACTOR] Found keyboard_events via traversal on {type(env).__name__}")
+                            break
+                        env = getattr(env, 'env', None)
 
-                if keyboard_events is not None and keyboard_events.get("pause_requested", False):
-                    logging.info("[ACTOR] Training PAUSED. Press '-' to resume.")
-                    while keyboard_events.get("pause_requested", False) and not shutdown_event.is_set():
-                        time.sleep(0.1)
-                    if not shutdown_event.is_set():
-                        logging.info("[ACTOR] Training RESUMED.")
+                if keyboard_events is None:
+                    logging.warning("[ACTOR] Could not find keyboard_events in wrapper chain")
+                else:
+                    pause_requested = keyboard_events.get("pause_requested", False)
+                    logging.debug(f"[ACTOR] pause_requested = {pause_requested}")
+                    if pause_requested:
+                        logging.info("[ACTOR] Training PAUSED. Press '-' to resume.")
+                        while keyboard_events.get("pause_requested", False) and not shutdown_event.is_set():
+                            time.sleep(0.1)
+                        if not shutdown_event.is_set():
+                            logging.info("[ACTOR] Training RESUMED.")
 
             if cfg.env.fps is not None:
                 dt_time = time.perf_counter() - start_time
