@@ -652,6 +652,23 @@ def act_with_policy(
                 if frame_stack_buffer is not None:
                     obs = frame_stack_buffer.reset(obs)
 
+                # Handle pause between episodes if requested via '-' key
+                # Traverse wrapper chain to find keyboard_events
+                keyboard_events = None
+                env = online_env
+                while env is not None:
+                    if hasattr(env, 'keyboard_events'):
+                        keyboard_events = env.keyboard_events
+                        break
+                    env = getattr(env, 'env', None)
+
+                if keyboard_events is not None and keyboard_events.get("pause_requested", False):
+                    logging.info("[ACTOR] Training PAUSED. Press '-' to resume.")
+                    while keyboard_events.get("pause_requested", False) and not shutdown_event.is_set():
+                        time.sleep(0.1)
+                    if not shutdown_event.is_set():
+                        logging.info("[ACTOR] Training RESUMED.")
+
             if cfg.env.fps is not None:
                 dt_time = time.perf_counter() - start_time
                 busy_wait(1 / cfg.env.fps - dt_time)

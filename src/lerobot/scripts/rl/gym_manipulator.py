@@ -1983,6 +1983,7 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             "episode_success": False,
             "episode_end": False,
             "rerecord_episode": False,
+            "pause_requested": False,
         }
 
     def _handle_key_press(self, key, keyboard_device):
@@ -2002,8 +2003,8 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             if key == keyboard_device.Key.left:
                 self.keyboard_events["rerecord_episode"] = True
                 return
-            if hasattr(key, "char") and key.char == "s":
-                logging.info("Key 's' pressed. Episode success triggered.")
+            if hasattr(key, "char") and key.char == "9":
+                logging.info("Key '9' pressed. Episode success triggered.")
                 self.keyboard_events["episode_success"] = True
                 return
         except Exception as e:
@@ -2025,12 +2026,16 @@ class BaseLeaderControlWrapper(gym.Wrapper):
                             if not self.keyboard_events["episode_end"]:
                                 logging.info("ESC pressed. Ending episode.")
                                 self.keyboard_events["episode_end"] = True
-                        elif hasattr(key, 'char') and key.char == 'k':
+                        elif hasattr(key, 'char') and key.char == '9':
                             if not self.keyboard_events["episode_success"]:
-                                logging.info("Key 'k' pressed. Episode success triggered.")
+                                logging.info("Key '9' pressed. Episode success triggered.")
                                 self.keyboard_events["episode_success"] = True
-                        elif hasattr(key, 'char') and key.char == 'i':
+                        elif hasattr(key, 'char') and key.char == '7':
                             self._handle_intervention_key()
+                        elif hasattr(key, 'char') and key.char == '-':
+                            self.keyboard_events["pause_requested"] = not self.keyboard_events["pause_requested"]
+                            status = "ENABLED" if self.keyboard_events["pause_requested"] else "DISABLED"
+                            logging.info(f"Key '-' pressed. Pause after episode {status}.")
                         elif key == keyboard.Key.left:
                             self.keyboard_events["rerecord_episode"] = True
                 except Exception as e:
@@ -2067,16 +2072,20 @@ class BaseLeaderControlWrapper(gym.Wrapper):
         with self.event_lock:
             if key == 27:  # ESC
                 self.keyboard_events["episode_end"] = True
-            elif key == ord('k'):
-                logging.info("Key 'k' pressed. Episode success triggered.")
+            elif key == ord('9'):
+                logging.info("Key '9' pressed. Episode success triggered.")
                 self.keyboard_events["episode_success"] = True
             elif key == 81:  # Left arrow
                 self.keyboard_events["rerecord_episode"] = True
-            elif key == ord('i'):  # 'i' for intervention (less accidental than space)
+            elif key == ord('7'):  # '7' for intervention
                 self._handle_intervention_key()
+            elif key == ord('-'):  # '-' for pause toggle
+                self.keyboard_events["pause_requested"] = not self.keyboard_events["pause_requested"]
+                status = "ENABLED" if self.keyboard_events["pause_requested"] else "DISABLED"
+                logging.info(f"Key '-' pressed. Pause after episode {status}.")
 
     def _handle_intervention_key(self):
-        """Handle 'i' key press for intervention. Override in subclasses for specific behavior."""
+        """Handle '7' key press for intervention. Override in subclasses for specific behavior."""
         pass
 
     def _check_intervention(self):
@@ -2340,33 +2349,33 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
             self.keyboard_events["human_intervention_step"] = True
             logging.info("Intervention enabled by default (record mode) - leader controls follower")
         else:
-            logging.info("Intervention OFF - press 'i' to enable leader control")
+            logging.info("Intervention OFF - press '7' to enable leader control")
         return result
 
     def _handle_key_press(self, key, keyboard_device):
         """
-        Handle key presses including 'i' for intervention toggle.
+        Handle key presses including '7' for intervention toggle.
 
         Args:
             key: The key that was pressed.
             keyboard: The keyboard module with key definitions.
 
-        Extends the base handler to respond to 'i' key for toggling intervention.
+        Extends the base handler to respond to '7' key for toggling intervention.
         """
         super()._handle_key_press(key, keyboard_device)
 
     def _handle_intervention_key(self):
-        """Toggle human intervention mode on 'i' key press."""
+        """Toggle human intervention mode on '7' key press."""
         if not self.keyboard_events["human_intervention_step"]:
             logging.info(
-                "'i' key pressed. Human intervention required.\n"
-                "Place the leader in similar pose to the follower and press 'i' again."
+                "'7' key pressed. Human intervention required.\n"
+                "Place the leader in similar pose to the follower and press '7' again."
             )
             self.keyboard_events["human_intervention_step"] = True
             log_say("Human intervention step.", play_sounds=False)
         else:
             self.keyboard_events["human_intervention_step"] = False
-            logging.info("'i' key pressed again.\nContinuing with policy actions.")
+            logging.info("'7' key pressed again.\nContinuing with policy actions.")
             log_say("Continuing with policy actions.", play_sounds=False)
 
     def _check_intervention(self):
@@ -2678,9 +2687,10 @@ class KeyboardControlWrapper(GamepadControlWrapper):
         print("  Shift and Shift_R: Move in Z axis")
         print("  Right Ctrl and Left Ctrl: Open and close gripper")
         print("  f: End episode with FAILURE")
-        print("  s: End episode with SUCCESS")
+        print("  9: End episode with SUCCESS")
         print("  r: End episode with RERECORD")
-        print("  i: Start/Stop Intervention")
+        print("  7: Start/Stop Intervention")
+        print("  -: Pause/Resume training (between episodes)")
 
     def get_teleop_commands(
         self,
@@ -2691,14 +2701,25 @@ class KeyboardControlWrapper(GamepadControlWrapper):
         # Unroll the misc_keys_queue to check for events related to intervention, episode success, etc.
         while not self.teleop_device.misc_keys_queue.empty():
             key = self.teleop_device.misc_keys_queue.get()
-            if key == "i":
+            if key == "7":
                 self.is_intervention_active = not self.is_intervention_active
             elif key == "f":
                 episode_end_status = "failure"
-            elif key == "s":
+            elif key == "9":
                 episode_end_status = "success"
             elif key == "r":
                 episode_end_status = "rerecord_episode"
+            elif key == "-":
+                self.pause_requested = not getattr(self, 'pause_requested', False)
+                status = "ENABLED" if self.pause_requested else "DISABLED"
+                logging.info(f"Key '-' pressed. Pause after episode {status}.")
+                # Also sync to keyboard_events if available in wrapper chain
+                env = self.env
+                while env is not None:
+                    if hasattr(env, 'keyboard_events'):
+                        env.keyboard_events["pause_requested"] = self.pause_requested
+                        break
+                    env = getattr(env, 'env', None)
 
         terminate_episode = episode_end_status is not None
         success = episode_end_status == "success"
