@@ -182,6 +182,12 @@ class SACConfig(PreTrainedConfig):
     # Gradient clipping norm for the SAC algorithm
     grad_clip_norm: float = 40.0
 
+    # Data augmentation (HIL-SERL uses random crop/shift)
+    # Whether to use random shift augmentation during training
+    use_augmentation: bool = False
+    # Padding for random shift augmentation (HIL-SERL uses 4)
+    augmentation_pad: int = 4
+
     # Network configuration
     # Configuration for the critic network architecture
     critic_network_kwargs: CriticNetworkConfig = field(default_factory=CriticNetworkConfig)

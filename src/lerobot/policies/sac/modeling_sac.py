@@ -36,6 +36,40 @@ from lerobot.policies.utils import get_device_from_parameters
 DISCRETE_DIMENSION_INDEX = -1  # Gripper is always the last dimension
 
 
+class RandomShiftsAug(nn.Module):
+    """Random shift augmentation from HIL-SERL/DrQ-v2.
+
+    Pads the image with replicate padding and randomly crops back to original size.
+    This is the key regularization technique that makes visual RL sample-efficient.
+    HIL-SERL uses batched_random_crop(padding=4).
+    """
+
+    def __init__(self, pad: int = 4):
+        super().__init__()
+        self.pad = pad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        n, c, h, w = x.size()
+        assert h == w, f"RandomShiftsAug requires square images, got {h}x{w}"
+        padding = tuple([self.pad] * 4)
+        x = F.pad(x, padding, "replicate")
+        eps = 1.0 / (h + 2 * self.pad)
+        arange = torch.linspace(
+            -1.0 + eps, 1.0 - eps, h + 2 * self.pad, device=x.device, dtype=x.dtype
+        )[:h]
+        arange = arange.unsqueeze(0).repeat(h, 1).unsqueeze(2)
+        base_grid = torch.cat([arange, arange.transpose(1, 0)], dim=2)
+        base_grid = base_grid.unsqueeze(0).repeat(n, 1, 1, 1)
+
+        shift = torch.randint(
+            0, 2 * self.pad + 1, size=(n, 1, 1, 2), device=x.device, dtype=x.dtype
+        )
+        shift *= 2.0 / (h + 2 * self.pad)
+
+        grid = base_grid + shift
+        return F.grid_sample(x, grid, padding_mode="zeros", align_corners=False)
+
+
 class SACPolicy(
     PreTrainedPolicy,
 ):
@@ -58,6 +92,12 @@ class SACPolicy(
         self._init_critics(continuous_action_dim)
         self._init_actor(continuous_action_dim)
         self._init_temperature()
+
+        # Initialize data augmentation (HIL-SERL uses random crop/shift)
+        if config.use_augmentation:
+            self.aug = RandomShiftsAug(pad=config.augmentation_pad)
+        else:
+            self.aug = nn.Identity()
 
     def get_optim_params(self) -> dict:
         optim_params = {
@@ -172,6 +212,11 @@ class SACPolicy(
             done: Tensor = batch["done"]
             next_observation_features: Tensor = batch.get("next_observation_feature")
 
+            # Apply data augmentation to images (HIL-SERL/DrQ-v2 style)
+            if self.training and self.config.use_augmentation:
+                observations = self._apply_augmentation(observations)
+                next_observations = self._apply_augmentation(next_observations)
+
             loss_critic = self.compute_loss_critic(
                 observations=observations,
                 actions=actions,
@@ -219,6 +264,29 @@ class SACPolicy(
             }
 
         raise ValueError(f"Unknown model type: {model}")
+
+    def _apply_augmentation(self, observations: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Apply random shift augmentation to image observations.
+
+        Args:
+            observations: Dictionary of observations, may contain image tensors
+
+        Returns:
+            Dictionary with augmented image observations
+        """
+        augmented = {}
+        for key, value in observations.items():
+            if is_image_feature(key) and value.dim() >= 4:
+                # value shape: (batch, channels, height, width) or (batch, views, channels, height, width)
+                if value.dim() == 5:
+                    # Multi-view: (batch, views, channels, height, width)
+                    b, v, c, h, w = value.shape
+                    value = self.aug(value.view(b * v, c, h, w)).view(b, v, c, h, w)
+                else:
+                    # Single view: (batch, channels, height, width)
+                    value = self.aug(value)
+            augmented[key] = value
+        return augmented
 
     def update_target_networks(self):
         """Update target networks with exponential moving average"""
