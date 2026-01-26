@@ -747,7 +747,7 @@ class AddCurrentToObservation(gym.ObservationWrapper):
 
 
 class RewardWrapper(gym.Wrapper):
-    def __init__(self, env, reward_classifier, device="cuda", min_steps_before_success=65,
+    def __init__(self, env, reward_classifier, device="cuda", min_steps_before_success=30,
                  consecutive_success_frames=10, display_reward=True, preview_queue=None):
         """
         Wrapper to add reward prediction to the environment using a trained classifier.
@@ -1262,19 +1262,14 @@ class ResetWrapper(gym.Wrapper):
             logging.info(f"Step 1 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
 
             # ============================================================
-            # STEP 2: Set wrist to configured locked joint positions
-            # Uses locked_joint_positions from config (default 90° if not set)
+            # STEP 2: Set wrist to top-down orientation (90° for wrist_flex and wrist_roll)
+            # This matches ik_grasp_demo.py: joints[3] = π/2, joints[4] = π/2
             # ============================================================
-            logging.info("IK reset step 2: Setting wrist to locked joint positions")
+            logging.info("IK reset step 2: Setting wrist to top-down orientation (90°)")
             topdown_joints_deg = np.array([pos_dict[name] for name in _IK_MOTOR_NAMES])
-            locked_joints = getattr(self.robot.config, 'locked_joints', None) or []
-            locked_joint_positions = getattr(self.robot.config, 'locked_joint_positions', {})
-            logging.info(f"Step 2 locked_joints={locked_joints}, locked_joint_positions={locked_joint_positions}")
-            for joint_idx in locked_joints:
-                if joint_idx < len(topdown_joints_deg):
-                    target_deg = locked_joint_positions.get(joint_idx,
-                                 locked_joint_positions.get(str(joint_idx), 90.0))
-                    topdown_joints_deg[joint_idx] = target_deg
+            # Hardcode wrist_flex (idx 3) and wrist_roll (idx 4) to 90°
+            topdown_joints_deg[3] = 90.0  # wrist_flex
+            topdown_joints_deg[4] = 90.0  # wrist_roll
             topdown_joints_deg = _clamp_degrees(topdown_joints_deg)
 
             action_dict = {name: topdown_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
@@ -1287,121 +1282,128 @@ class ResetWrapper(gym.Wrapper):
             logging.info(f"Step 2 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
 
             # Compute reset target (with optional random offset for per-episode variation)
+            # Only randomize X and Y - Z stays fixed for consistent grasp height
             if self.random_ee_reset:
-                offset = np.array([
+                offset_xy = np.array([
                     np.random.uniform(-self.random_ee_range_xy, self.random_ee_range_xy),
                     np.random.uniform(-self.random_ee_range_xy, self.random_ee_range_xy),
-                    np.random.uniform(-self.random_ee_range_z, self.random_ee_range_z)
                 ])
-                reset_target_ee = self.ik_reset_ee_pos + offset
-                logging.info(f"Random EE reset: base={self.ik_reset_ee_pos}, offset={offset}, target={reset_target_ee}")
+                reset_target_ee = self.ik_reset_ee_pos.copy()
+                reset_target_ee[0] += offset_xy[0]
+                reset_target_ee[1] += offset_xy[1]
+                logging.info(f"Random EE reset: base={self.ik_reset_ee_pos}, offset_xy={offset_xy}, target={reset_target_ee}")
             else:
-                reset_target_ee = self.ik_reset_ee_pos
+                reset_target_ee = self.ik_reset_ee_pos.copy()
 
             # ============================================================
-            # STEP 3: Apply closed-loop IK to reach target EE position
+            # STEP 3: Move ABOVE target position (like ik_grasp_demo.py)
+            # STEP 4: Lower to target position
             # ============================================================
-            logging.info(f"IK reset step 3: Moving to EE target {reset_target_ee}")
-            ik_converged = False
-            prev_error = float('inf')
-            stuck_count = 0
+            HEIGHT_OFFSET = 0.07  # 7cm above target for approach
 
-            for ik_step in range(50):
-                # 1. Read actual robot position - bus returns DEGREES (with retries)
-                current_pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
-                current_joints_deg = np.array([current_pos_dict[name] for name in _IK_MOTOR_NAMES])
+            # Build list of targets: first above, then final position
+            above_target = reset_target_ee.copy()
+            above_target[2] += HEIGHT_OFFSET
+            ik_targets = [
+                ("Step 3 (above)", above_target),
+                ("Step 4 (lower)", reset_target_ee),
+            ]
 
-                # 2. Convert to radians (simple deg2rad - bus uses DEGREES mode!)
-                current_joints_rad = np.deg2rad(current_joints_deg)
+            for step_name, ik_target in ik_targets:
+                logging.info(f"IK reset {step_name}: Moving to EE target {ik_target}")
+                ik_converged = False
+                prev_error = float('inf')
+                stuck_count = 0
 
-                # 3. Sync MuJoCo to actual position and check error
-                self.robot._sync_mujoco(current_joints_rad)
-                current_ee = self.robot._get_ee_position()
-                error = np.linalg.norm(reset_target_ee - current_ee)
+                for ik_step in range(50):
+                    # 1. Read actual robot position - bus returns DEGREES (with retries)
+                    current_pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
+                    current_joints_deg = np.array([current_pos_dict[name] for name in _IK_MOTOR_NAMES])
 
-                if ik_step == 0:
-                    logging.info(f"Step 3 start: EE={current_ee}, error={error:.4f}m")
+                    # 2. Convert to radians (simple deg2rad - bus uses DEGREES mode!)
+                    current_joints_rad = np.deg2rad(current_joints_deg)
 
-                # Converged within 1.5cm
-                if error < 0.015:
-                    logging.info(f"IK reset converged at step {ik_step}, error={error:.4f}m")
-                    ik_converged = True
-                    break
+                    # 3. Sync MuJoCo to actual position and check error
+                    self.robot._sync_mujoco(current_joints_rad)
+                    current_ee = self.robot._get_ee_position()
+                    error = np.linalg.norm(ik_target - current_ee)
 
-                # Detect if stuck (error not improving)
-                if abs(error - prev_error) < 0.0005:
-                    stuck_count += 1
-                    if stuck_count >= 3:
-                        logging.info(f"IK reset done (converged), step {ik_step}, error={error:.4f}m")
-                        ik_converged = error < 0.025  # Accept if within 2.5cm
+                    if ik_step == 0:
+                        logging.info(f"{step_name} start: EE={current_ee}, error={error:.4f}m")
+
+                    # Converged within 1.5cm
+                    if error < 0.015:
+                        logging.info(f"{step_name} converged at step {ik_step}, error={error:.4f}m")
+                        ik_converged = True
                         break
-                else:
-                    stuck_count = 0
-                prev_error = error
 
-                # 4. Compute IK from actual current position
-                target_joints_rad = self.robot._compute_ik(reset_target_ee, current_joints_rad)
+                    # Detect if stuck (error not improving)
+                    if abs(error - prev_error) < 0.0005:
+                        stuck_count += 1
+                        if stuck_count >= 3:
+                            logging.info(f"{step_name} done (stuck), step {ik_step}, error={error:.4f}m")
+                            ik_converged = error < 0.025  # Accept if within 2.5cm
+                            break
+                    else:
+                        stuck_count = 0
+                    prev_error = error
 
-                # 4b. Enforce locked joint positions from config (IK preserves current, we need target)
-                locked_joints = getattr(self.robot.config, 'locked_joints', None) or []
-                locked_joint_positions = getattr(self.robot.config, 'locked_joint_positions', {})
-                for joint_idx in locked_joints:
-                    if joint_idx < len(target_joints_rad):
-                        target_deg = locked_joint_positions.get(joint_idx,
-                                     locked_joint_positions.get(str(joint_idx), 90.0))
-                        target_joints_rad[joint_idx] = np.deg2rad(target_deg)
+                    # 4. Compute IK from actual current position
+                    target_joints_rad = self.robot._compute_ik(ik_target, current_joints_rad)
 
-                # 5. Convert back to degrees (simple rad2deg - bus expects DEGREES!)
-                target_joints_deg = np.rad2deg(target_joints_rad)
+                    # 5. Convert back to degrees (simple rad2deg - bus expects DEGREES!)
+                    target_joints_deg = np.rad2deg(target_joints_rad)
 
-                # 6. Clamp delta to max 10° per step so robot can keep up
-                delta_deg = target_joints_deg - current_joints_deg
-                max_delta = 10.0  # degrees per step
-                delta_deg = np.clip(delta_deg, -max_delta, max_delta)
-                target_joints_deg = current_joints_deg + delta_deg
+                    # 6. Clamp delta to max 10° per step so robot can keep up
+                    delta_deg = target_joints_deg - current_joints_deg
+                    max_delta = 10.0  # degrees per step
+                    delta_deg = np.clip(delta_deg, -max_delta, max_delta)
+                    target_joints_deg = current_joints_deg + delta_deg
 
-                # 6a. Re-enforce locked joint positions after delta clamping
-                # (delta clamping would otherwise overwrite the enforcement from step 4b)
-                for joint_idx in locked_joints:
-                    if joint_idx < len(target_joints_deg):
-                        target_deg = locked_joint_positions.get(joint_idx,
-                                     locked_joint_positions.get(str(joint_idx), 90.0))
-                        target_joints_deg[joint_idx] = target_deg
+                    # 6b. Clamp to valid encoder range (DEGREES mode doesn't clamp!)
+                    target_joints_deg = _clamp_degrees(target_joints_deg)
 
-                # 6b. Clamp to valid encoder range (DEGREES mode doesn't clamp!)
-                target_joints_deg = _clamp_degrees(target_joints_deg)
+                    # 7. Build action dict and send to robot
+                    gripper_pos = current_pos_dict.get("gripper", 50.0)
+                    action_dict = {name: target_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
+                    action_dict["gripper"] = gripper_pos
 
-                # 7. Build action dict and send to robot
-                gripper_pos = current_pos_dict.get("gripper", 50.0)
-                action_dict = {name: target_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
-                action_dict["gripper"] = gripper_pos
+                    # Log progress every 10 steps
+                    if ik_step % 10 == 0:
+                        logging.info(f"{step_name} iter {ik_step}: error={error:.4f}m, EE={current_ee}")
 
-                # Log progress every 10 steps
-                if ik_step % 10 == 0:
-                    logging.info(f"Step 3 iter {ik_step}: error={error:.4f}m, EE={current_ee}")
+                    self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
 
-                self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
+                    # 8. Wait for robot to move (100ms to allow motor movement)
+                    busy_wait(0.1)
 
-                # 8. Wait for robot to move (100ms to allow motor movement)
-                busy_wait(0.1)
-
-            if not ik_converged:
-                logging.warning(f"IK reset did not fully converge, final error={error:.4f}m")
+                if not ik_converged:
+                    logging.warning(f"{step_name} did not fully converge, final error={error:.4f}m")
 
             # IK reset complete
             logging.info("IK reset complete")
 
-            # Disable leader torque so user can teleoperate freely
+            # Reset leader arm to match follower position (keeps leader locked)
+            if hasattr(self.env, "robot_leader"):
+                # Read follower position
+                follower_pos = self.robot.bus.sync_read("Present_Position", num_retry=3)
+                # Move leader to match (with torque enabled)
+                self.env.robot_leader.bus.sync_write("Torque_Enable", 1, num_retry=3)
+                self.env.robot_leader.bus.sync_write("Goal_Position", follower_pos, num_retry=3)
+                logging.info("Leader arm synced to follower position (locked)")
+
+            # Wait for user to reposition objects if delay configured
+            if self.reset_delay_s > 0:
+                log_say(f"Place cube. {int(self.reset_delay_s)} seconds.", play_sounds=True)
+                logging.info(f"Waiting {self.reset_delay_s}s for object repositioning...")
+                time.sleep(self.reset_delay_s)
+
+            # Now disable leader torque so user can teleoperate freely
             if hasattr(self.env, "robot_leader"):
                 self.env.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
                 logging.info("Leader torque disabled for teleoperation")
 
             log_say("Episode starting", play_sounds=True)
-
-            # Wait for user to reposition objects if delay configured
-            if self.reset_delay_s > 0:
-                logging.info(f"Waiting {self.reset_delay_s}s for object repositioning...")
-                time.sleep(self.reset_delay_s)
 
             return super().reset(seed=seed, options=options)
 
