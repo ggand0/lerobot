@@ -1173,6 +1173,9 @@ class ResetWrapper(gym.Wrapper):
         ik_reset_ee_pos: list | None = None,
         reset_delay_s: float = 0.0,
         capture_home_on_start: bool = False,
+        random_ee_reset: bool = False,
+        random_ee_range_xy: float = 0.03,
+        random_ee_range_z: float = 0.02,
     ):
         """
         Initialize the reset wrapper.
@@ -1189,6 +1192,9 @@ class ResetWrapper(gym.Wrapper):
                     - z=0.05 (CUBE_Z + GRASP_Z_OFFSET + HEIGHT_OFFSET = 0.015 + 0.005 + 0.03)
             reset_delay_s: Time in seconds to wait after reset (for repositioning objects).
             capture_home_on_start: If True, use current position as home (no reset motion).
+            random_ee_reset: If True, add random offset to IK reset EE position each episode.
+            random_ee_range_xy: Random offset range for x,y in meters (default ±3cm).
+            random_ee_range_z: Random offset range for z in meters (default ±2cm).
         """
         super().__init__(env)
         self.reset_time_s = reset_time_s
@@ -1200,6 +1206,9 @@ class ResetWrapper(gym.Wrapper):
         self.reset_delay_s = reset_delay_s
         self._ik_reset_pose = None  # Cached IK-computed reset pose
         self.capture_home_on_start = capture_home_on_start
+        self.random_ee_reset = random_ee_reset
+        self.random_ee_range_xy = random_ee_range_xy
+        self.random_ee_range_z = random_ee_range_z
 
     def reset(self, *, seed=None, options=None):
         """
@@ -1277,10 +1286,22 @@ class ResetWrapper(gym.Wrapper):
             pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
             logging.info(f"Step 2 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
 
+            # Compute reset target (with optional random offset for per-episode variation)
+            if self.random_ee_reset:
+                offset = np.array([
+                    np.random.uniform(-self.random_ee_range_xy, self.random_ee_range_xy),
+                    np.random.uniform(-self.random_ee_range_xy, self.random_ee_range_xy),
+                    np.random.uniform(-self.random_ee_range_z, self.random_ee_range_z)
+                ])
+                reset_target_ee = self.ik_reset_ee_pos + offset
+                logging.info(f"Random EE reset: base={self.ik_reset_ee_pos}, offset={offset}, target={reset_target_ee}")
+            else:
+                reset_target_ee = self.ik_reset_ee_pos
+
             # ============================================================
             # STEP 3: Apply closed-loop IK to reach target EE position
             # ============================================================
-            logging.info(f"IK reset step 3: Moving to EE target {self.ik_reset_ee_pos}")
+            logging.info(f"IK reset step 3: Moving to EE target {reset_target_ee}")
             ik_converged = False
             prev_error = float('inf')
             stuck_count = 0
@@ -1296,7 +1317,7 @@ class ResetWrapper(gym.Wrapper):
                 # 3. Sync MuJoCo to actual position and check error
                 self.robot._sync_mujoco(current_joints_rad)
                 current_ee = self.robot._get_ee_position()
-                error = np.linalg.norm(self.ik_reset_ee_pos - current_ee)
+                error = np.linalg.norm(reset_target_ee - current_ee)
 
                 if ik_step == 0:
                     logging.info(f"Step 3 start: EE={current_ee}, error={error:.4f}m")
@@ -1319,7 +1340,7 @@ class ResetWrapper(gym.Wrapper):
                 prev_error = error
 
                 # 4. Compute IK from actual current position
-                target_joints_rad = self.robot._compute_ik(self.ik_reset_ee_pos, current_joints_rad)
+                target_joints_rad = self.robot._compute_ik(reset_target_ee, current_joints_rad)
 
                 # 4b. Enforce locked joint positions from config (IK preserves current, we need target)
                 locked_joints = getattr(self.robot.config, 'locked_joints', None) or []
@@ -2964,6 +2985,9 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     ik_reset_ee_pos = getattr(cfg.wrapper, 'ik_reset_ee_pos', None)
     reset_delay_s = getattr(cfg.wrapper, 'reset_delay_s', 0.0)
     capture_home_on_start = getattr(cfg.wrapper, 'capture_home_on_start', False)
+    random_ee_reset = getattr(cfg.wrapper, 'random_ee_reset', False)
+    random_ee_range_xy = getattr(cfg.wrapper, 'random_ee_range_xy', 0.03)
+    random_ee_range_z = getattr(cfg.wrapper, 'random_ee_range_z', 0.02)
 
     env = ResetWrapper(
         env=env,
@@ -2973,6 +2997,9 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
         ik_reset_ee_pos=ik_reset_ee_pos,
         reset_delay_s=reset_delay_s,
         capture_home_on_start=capture_home_on_start,
+        random_ee_reset=random_ee_reset,
+        random_ee_range_xy=random_ee_range_xy,
+        random_ee_range_z=random_ee_range_z,
     )
 
     env = BatchCompatibleWrapper(env=env)

@@ -193,6 +193,9 @@ class EnvTransformConfig:
     use_ik_reset: bool = False  # If True, use IK to compute reset joint positions from EE target
     ik_reset_ee_pos: list[float] | None = None  # Target EE position [x, y, z] for IK reset
     capture_home_on_start: bool = False  # If True, capture current position as home on first reset
+    random_ee_reset: bool = False  # If True, add random offset to IK reset EE position each episode
+    random_ee_range_xy: float = 0.03  # Random offset range for x,y in meters (±3cm default)
+    random_ee_range_z: float = 0.02  # Random offset range for z in meters (±2cm default)
     use_gripper: bool = True
     gripper_quantization_threshold: float | None = 0.8
     gripper_penalty: float = 0.0
