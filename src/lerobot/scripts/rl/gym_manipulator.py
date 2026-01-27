@@ -770,7 +770,7 @@ class RewardWrapper(gym.Wrapper):
         self.success_streak = 0
         self.display_reward = display_reward
         self.last_reward_prob = 0.0
-        self.reward_threshold = 0.7
+        self.reward_threshold = 0.9
 
         self.reward_classifier = torch.compile(reward_classifier)
         self.reward_classifier.to(self.device)
