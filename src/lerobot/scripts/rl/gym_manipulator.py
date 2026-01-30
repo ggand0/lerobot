@@ -1671,9 +1671,11 @@ class GripperActionWrapper(gym.ActionWrapper):
                 self.last_gripper_action = action[-1]
 
         gripper_command = action[-1]
-        # Gripper actions are between 0, 2
-        # we want to quantize them to -1, 0 or 1
-        gripper_command = gripper_command - 1.0
+        # Gripper actions from policy are in [-1, 1] (tanh output)
+        # -1 = close, 0 = no change, 1 = open
+        # Handle legacy [0, 2] format from action_space.sample() by converting to [-1, 1]
+        if gripper_command > 1.0:
+            gripper_command = gripper_command - 1.0  # [0, 2] -> [-1, 1]
 
         if self.quantization_threshold is not None:
             # Quantize gripper command to -1, 0 or 1
