@@ -36,6 +36,7 @@ Example:
     obs, reward, terminated, truncated, info = env.step(action)
 """
 
+import atexit
 import logging
 import signal
 import time
@@ -426,6 +427,16 @@ class RobotEnv(gym.Env):
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
             self.robot.connect()
+
+        # Register atexit handler to disable torque on exit (handles crashes, Ctrl+C, etc.)
+        def _cleanup_torque():
+            try:
+                if hasattr(self.robot, 'bus') and self.robot.bus is not None:
+                    logging.info("[RobotEnv] atexit: Disabling motor torque...")
+                    self.robot.bus.sync_write("Torque_Enable", {name: False for name in self.robot.bus.motors})
+            except Exception as e:
+                logging.warning(f"[RobotEnv] atexit: Failed to disable torque: {e}")
+        atexit.register(_cleanup_torque)
 
         # Episode tracking.
         self.current_step = 0
