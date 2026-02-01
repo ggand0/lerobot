@@ -282,14 +282,23 @@ class SO101FollowerEndEffector(SO101Follower):
                 f"joint_deltas_deg={joint_deltas_deg}"
             )
 
-        # Handle gripper (action in [0, 2] where 1 = no-op)
+        # Handle gripper: [-1, 1] where -1=close, 0=no-op, 1=open
+        # Legacy teleop uses [0, 2]: 0=close, 1=no-op, 2=open
         current_gripper = current_pos_dict["gripper"]
-        gripper_delta = (action[-1] - 1) * self.config.max_gripper_pos
-        joint_action["gripper.pos"] = np.clip(
+        gripper_action = action[-1]
+
+        # Convert legacy [0, 2] format
+        if gripper_action > 1.0:
+            gripper_action = gripper_action - 1.0
+
+        gripper_delta = gripper_action * self.config.max_gripper_pos
+        new_gripper_pos = np.clip(
             current_gripper + gripper_delta,
             5,
             self.config.max_gripper_pos,
         )
+
+        joint_action["gripper.pos"] = new_gripper_pos
 
         # Send to parent class
         return super().send_action(joint_action)

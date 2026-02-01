@@ -502,8 +502,10 @@ class RobotEnv(gym.Env):
 
         if self.use_gripper:
             action_dim += 1
-            bounds["min"] = np.concatenate([bounds["min"], [0]])
-            bounds["max"] = np.concatenate([bounds["max"], [2]])
+            # Gripper action space [-1, 1] to match SAC tanh output
+            # -1 = close, 0 = no-op, 1 = open
+            bounds["min"] = np.concatenate([bounds["min"], [-1]])
+            bounds["max"] = np.concatenate([bounds["max"], [1]])
 
         self.action_space = gym.spaces.Box(
             low=bounds["min"],
@@ -2223,14 +2225,15 @@ class BaseLeaderControlWrapper(gym.Wrapper):
             leader_gripper = leader_pos[-1]
             gripper_delta = leader_gripper - self.prev_leader_gripper
 
-            # Normalize by max angle and quantize to {0,1,2}
+            # Normalize by max angle and quantize to {-1, 0, 1}
+            # This matches SAC's tanh output range [-1, 1]
             normalized_delta = gripper_delta / max_gripper_pos
             if normalized_delta >= 0.3:
-                gripper_action = 2
-            elif normalized_delta <= 0.1:
-                gripper_action = 0
+                gripper_action = 1   # open
+            elif normalized_delta <= -0.3:
+                gripper_action = -1  # close
             else:
-                gripper_action = 1
+                gripper_action = 0   # no-op
 
             action = np.append(action, gripper_action)
 
