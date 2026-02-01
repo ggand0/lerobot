@@ -689,6 +689,19 @@ def act_with_policy(
         logging.info("[ACTOR] Cleaning up - returning robot to safe position")
         safe_return_to_home(online_env)
 
+        # Disable torque so motors can be moved freely
+        logging.info("[ACTOR] Disabling motor torque...")
+        try:
+            robot = online_env.unwrapped.robot
+            if hasattr(robot, 'bus'):
+                robot.bus.sync_write("Torque_Enable", {name: False for name in robot.bus.motor_names})
+                logging.info("[ACTOR] Motor torque disabled")
+        except Exception as e:
+            logging.warning(f"[ACTOR] Failed to disable torque: {e}")
+
+        # Close the environment
+        online_env.close()
+
 
 #################################################
 #  Communication Functions - Group all gRPC/messaging functions  #
