@@ -135,7 +135,20 @@ class SACPolicy(
 
         if self.config.num_discrete_actions is not None:
             discrete_action_value = self.discrete_critic(batch, observations_features)
-            discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+            # Epsilon-greedy exploration for discrete actions (always applied during RL training)
+            if self.config.discrete_action_epsilon > 0:
+                batch_size = discrete_action_value.shape[0]
+                # Random exploration with probability epsilon
+                explore_mask = torch.rand(batch_size, device=discrete_action_value.device) < self.config.discrete_action_epsilon
+                random_action = torch.randint(
+                    0, self.config.num_discrete_actions,
+                    (batch_size, 1),
+                    device=discrete_action_value.device
+                )
+                greedy_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
+                discrete_action = torch.where(explore_mask.unsqueeze(-1), random_action, greedy_action)
+            else:
+                discrete_action = torch.argmax(discrete_action_value, dim=-1, keepdim=True)
             actions = torch.cat([actions, discrete_action], dim=-1)
 
         return actions
