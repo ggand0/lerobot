@@ -188,6 +188,16 @@ class EnvTransformConfig:
     gripper_quantization_threshold: float | None = 0.8
     gripper_penalty: float = 0.0
     gripper_penalty_in_reward: bool = False
+    # IK reset configuration
+    use_ik_reset: bool = False
+    ik_reset_ee_pos: list[float] | None = None  # Target [x, y, z] in meters
+    reset_delay_s: float = 0.0  # Post-reset pause for object placement
+    capture_home_on_start: bool = False  # Use current position as home
+    random_ee_reset: bool = False  # Per-episode random EE offset
+    random_ee_range_xy: float = 0.03  # ±3cm for x,y
+    random_ee_range_z: float = 0.02  # ±2cm for z
+    # Image normalization
+    normalize_images: bool = True  # False keeps images as [0,255]
 
 
 @EnvConfig.register_subclass(name="gym_manipulator")

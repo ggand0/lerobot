@@ -123,6 +123,7 @@ class OpenCVCamera(Camera):
         self.frame_lock: Lock = Lock()
         self.latest_frame: np.ndarray | None = None
         self.new_frame_event: Event = Event()
+        self.last_successful_read: float = 0.0  # Watchdog: track last successful read time
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
         self.backend: int = get_cv2_backend()
@@ -202,6 +203,11 @@ class OpenCVCamera(Camera):
 
         self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
+        # Use MJPG format and small buffer to reduce USB bandwidth and latency
+        if self.videocapture.isOpened():
+            self.videocapture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.videocapture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         if not self.videocapture.isOpened():
             self.videocapture.release()
             self.videocapture = None
@@ -212,6 +218,8 @@ class OpenCVCamera(Camera):
                 logger.info(f"Auto-detected camera: {working_device}")
                 self.index_or_path = working_device
                 self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+                self.videocapture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                self.videocapture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             else:
                 raise ConnectionError(
                     f"Failed to open {self} and no working cameras found. "
@@ -441,18 +449,40 @@ class OpenCVCamera(Camera):
 
         Stops on DeviceNotConnectedError, logs other errors and continues.
         """
+        consecutive_failures = 0
+        max_failures = 10
         while not self.stop_event.is_set():
             try:
                 color_image = self.read()
 
                 with self.frame_lock:
                     self.latest_frame = color_image
+                    self.last_successful_read = time.perf_counter()
                 self.new_frame_event.set()
+                consecutive_failures = 0
 
             except DeviceNotConnectedError:
                 break
             except Exception as e:
-                logger.warning(f"Error reading frame in background thread for {self}: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.warning(f"{self}: {consecutive_failures} consecutive read failures, attempting reconnect...")
+                    try:
+                        if self.videocapture is not None:
+                            self.videocapture.release()
+                        working_device = self._find_working_camera()
+                        if working_device:
+                            logger.info(f"{self}: Reconnected to {working_device}")
+                            self.index_or_path = working_device
+                            self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+                            self._configure_capture_settings()
+                            consecutive_failures = 0
+                        else:
+                            logger.error(f"{self}: No working camera found")
+                    except Exception as reconnect_error:
+                        logger.error(f"{self}: Reconnect failed: {reconnect_error}")
+                else:
+                    logger.warning(f"Error reading frame in background thread for {self}: {e}")
 
     def _start_read_thread(self) -> None:
         """Starts or restarts the background read thread if it's not running."""
@@ -476,6 +506,38 @@ class OpenCVCamera(Camera):
 
         self.thread = None
         self.stop_event = None
+
+    def _force_reconnect(self) -> None:
+        """Force reconnect when background thread is stuck on read()."""
+        logger.warning(f"{self}: Force reconnecting camera...")
+
+        # Signal thread to stop (it may be stuck, so don't wait long)
+        if self.stop_event is not None:
+            self.stop_event.set()
+
+        # Release videocapture to unblock stuck read()
+        if self.videocapture is not None:
+            self.videocapture.release()
+            self.videocapture = None
+
+        # Brief wait for thread to notice
+        if self.thread is not None:
+            self.thread.join(timeout=0.5)
+
+        self.thread = None
+        self.stop_event = None
+
+        # Find and reconnect to working camera
+        working_device = self._find_working_camera()
+        if working_device:
+            logger.info(f"{self}: Reconnected to {working_device}")
+            self.index_or_path = working_device
+            self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+            self._configure_capture_settings()
+            self.last_successful_read = 0.0
+            self._start_read_thread()
+        else:
+            logger.error(f"{self}: No working camera found during force reconnect")
 
     def async_read(self, timeout_ms: float = 200) -> np.ndarray:
         """
@@ -506,6 +568,21 @@ class OpenCVCamera(Camera):
 
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
             thread_alive = self.thread is not None and self.thread.is_alive()
+
+            # Watchdog: if thread is alive but stuck on read() for > 0.5 seconds, force reconnect
+            if thread_alive and self.last_successful_read > 0:
+                time_since_last_read = time.perf_counter() - self.last_successful_read
+                if time_since_last_read > 0.5:
+                    logger.warning(f"{self}: Thread stuck for {time_since_last_read:.1f}s, forcing reconnect...")
+                    self._force_reconnect()
+                    # Try once more after reconnect
+                    if self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+                        with self.frame_lock:
+                            frame = self.latest_frame
+                            self.new_frame_event.clear()
+                        if frame is not None:
+                            return frame
+
             raise TimeoutError(
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
                 f"Read thread alive: {thread_alive}."

@@ -54,6 +54,15 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
     # End-effector frame name in the URDF
     target_frame_name: str = "gripper_frame_link"
 
+    # Joints to lock during IK (0=shoulder_pan, 1=shoulder_lift, 2=elbow_flex, 3=wrist_flex, 4=wrist_roll)
+    # Use None as default so JSON values override properly (draccus issue with default_factory)
+    locked_joints: list[int] | None = None
+
+    # Target positions (degrees) for locked joints during teleoperation
+    # Maps joint index to target angle. If not specified, defaults to 90°.
+    # Use None as default so JSON values override properly
+    locked_joint_positions: dict[str, float] | None = None
+
     # Default bounds for the end-effector position (in meters)
     end_effector_bounds: dict[str, list[float]] = field(
         default_factory=lambda: {
@@ -64,10 +73,15 @@ class SO101FollowerEndEffectorConfig(SO101FollowerConfig):
 
     max_gripper_pos: float = 50
 
-    end_effector_step_sizes: dict[str, float] = field(
-        default_factory=lambda: {
-            "x": 0.02,
-            "y": 0.02,
-            "z": 0.02,
-        }
-    )
+    # Action scale: meters per action unit (same as sim training)
+    action_scale: float = 0.02
+
+    # Enable verbose debug logging for IK, torque, and motor commands
+    debug_ik: bool = False
+
+    def __post_init__(self):
+        # Set defaults for fields that use None to work around draccus default_factory issues
+        if self.locked_joints is None:
+            self.locked_joints = [3, 4]  # Lock wrist_flex and wrist_roll by default
+        if self.locked_joint_positions is None:
+            self.locked_joint_positions = {"3": 90.0, "4": 90.0}
