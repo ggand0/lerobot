@@ -285,28 +285,31 @@ class OpenCVCamera(Camera):
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
 
-        success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
+        self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
-        # Use math.isclose for robust float comparison
-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
+        # Use math.isclose for robust float comparison (ignore success flag — some
+        # cameras return False from set() but still report the correct fps)
+        if not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
             raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
 
     def _validate_width_and_height(self) -> None:
         """Validates and sets the camera's frame capture width and height."""
 
-        width_success = self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
-        height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
+        self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
+        self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
+        # Ignore success flag — some V4L2 drivers return False even when the
+        # setting is applied correctly. Only check the actual reported values.
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
+        if self.capture_width != actual_width:
             raise RuntimeError(
-                f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
+                f"{self} failed to set capture_width={self.capture_width} ({actual_width=})."
             )
 
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
+        if self.capture_height != actual_height:
             raise RuntimeError(
-                f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+                f"{self} failed to set capture_height={self.capture_height} ({actual_height=})."
             )
 
     @staticmethod
