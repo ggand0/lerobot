@@ -200,7 +200,10 @@ def train(cfg: TrainPipelineConfig):
     )
 
     logging.info("Start offline training on a fixed dataset")
-    for _ in range(step, cfg.steps):
+    from tqdm import tqdm
+
+    pbar = tqdm(range(step, cfg.steps), initial=step, total=cfg.steps, desc="Training", unit="step")
+    for _ in pbar:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         train_tracker.dataloading_s = time.perf_counter() - start_time
@@ -229,6 +232,7 @@ def train(cfg: TrainPipelineConfig):
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
         if is_log_step:
+            pbar.set_postfix(loss=f"{train_tracker.loss.avg:.4f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}")
             logging.info(train_tracker)
             if wandb_logger:
                 wandb_log_dict = train_tracker.to_dict()
