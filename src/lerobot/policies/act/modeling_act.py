@@ -490,6 +490,8 @@ class ACT(nn.Module):
             # NOTE: If modifying this section, verify on MPS devices that
             # gradients remain stable (no explosions or NaNs).
             for img in batch["observation.images"]:
+                if self.config.resize_imgs is not None:
+                    img = _resize_with_pad(img, *self.config.resize_imgs)
                 cam_features = self.backbone(img)["feature_map"]
                 cam_pos_embed = self.encoder_cam_feat_pos_embed(cam_features).to(dtype=cam_features.dtype)
                 cam_features = self.encoder_img_feat_input_proj(cam_features)
@@ -753,6 +755,18 @@ class ACTSinusoidalPositionEmbedding2d(nn.Module):
         pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)  # (1, C, H, W)
 
         return pos_embed
+
+
+def _resize_with_pad(img: Tensor, height: int, width: int, pad_value: float = 0) -> Tensor:
+    """Resize image tensor preserving aspect ratio, then pad to target size."""
+    _, _, cur_h, cur_w = img.shape
+    ratio = max(cur_h / height, cur_w / width)
+    resized_h = int(cur_h / ratio)
+    resized_w = int(cur_w / ratio)
+    img = torch.nn.functional.interpolate(img, size=(resized_h, resized_w), mode="bilinear", align_corners=False)
+    pad_h = max(0, height - resized_h)
+    pad_w = max(0, width - resized_w)
+    return torch.nn.functional.pad(img, (pad_w, 0, pad_h, 0), value=pad_value)
 
 
 def get_activation_fn(activation: str) -> Callable:
