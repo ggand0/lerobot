@@ -36,7 +36,10 @@ Example:
     obs, reward, terminated, truncated, info = env.step(action)
 """
 
+import atexit
+import json
 import logging
+import signal
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -73,18 +76,173 @@ from lerobot.utils.utils import log_say
 logging.basicConfig(level=logging.INFO)
 
 
+# =============================================================================
+# IK Reset Constants
+# =============================================================================
+# Motor names for IK (5 arm joints, excluding gripper)
+_IK_MOTOR_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
+
+# Calibration for IK degree clamping
+_IK_CALIBRATION_PATH = "/home/gota/.cache/huggingface/lerobot/calibration/robots/so101_follower/ggando_so101_follower.json"
+_IK_CALIBRATION_CACHE = None
+_IK_DEGREE_LIMITS = None
+
+
+def _load_ik_calibration():
+    """Load calibration data for IK degree limits."""
+    global _IK_CALIBRATION_CACHE
+    if _IK_CALIBRATION_CACHE is None:
+        with open(_IK_CALIBRATION_PATH) as f:
+            _IK_CALIBRATION_CACHE = json.load(f)
+    return _IK_CALIBRATION_CACHE
+
+
+def _get_degree_limits():
+    """Get valid degree range for each joint from calibration.
+
+    DEGREES mode formula: encoder = (degrees * 4095 / 360) + mid
+    Inverted: degrees = (encoder - mid) * 360 / 4095
+
+    Must prevent:
+    1. Encoder < 0 (causes ValueError in bus)
+    2. Encoder > 4095 (invalid for servo)
+    3. Encoder outside [range_min, range_max] (calibration limits)
+    """
+    cal = _load_ik_calibration()
+    limits = {}
+    for name in _IK_MOTOR_NAMES:
+        range_min = cal[name]["range_min"]
+        range_max = cal[name]["range_max"]
+        mid = (range_min + range_max) / 2
+
+        # Limits from calibration range
+        cal_min_deg = (range_min - mid) * 360 / 4095
+        cal_max_deg = (range_max - mid) * 360 / 4095
+
+        # Limits to prevent negative/overflow encoder (encoder in [0, 4095])
+        enc_min_deg = (0 - mid) * 360 / 4095      # encoder = 0
+        enc_max_deg = (4095 - mid) * 360 / 4095   # encoder = 4095
+
+        # Take most restrictive limits
+        min_deg = max(cal_min_deg, enc_min_deg)
+        max_deg = min(cal_max_deg, enc_max_deg)
+
+        limits[name] = (min_deg, max_deg)
+    return limits
+
+
+def _clamp_degrees(joints_deg: np.ndarray) -> np.ndarray:
+    """Clamp degree values to valid encoder range.
+
+    DEGREES mode in motors_bus.py doesn't clamp values, so out-of-range
+    degree values produce invalid encoder positions that motors reject.
+    """
+    global _IK_DEGREE_LIMITS
+    if _IK_DEGREE_LIMITS is None:
+        _IK_DEGREE_LIMITS = _get_degree_limits()
+    clamped = joints_deg.copy()
+    for i, name in enumerate(_IK_MOTOR_NAMES):
+        min_deg, max_deg = _IK_DEGREE_LIMITS[name]
+        clamped[i] = np.clip(joints_deg[i], min_deg, max_deg)
+    return clamped
+
+
+def _robust_sync_read(bus, data_name: str, max_attempts: int = 10, delay_between_attempts: float = 0.2):
+    """Robust sync_read with delays between retries and port recovery."""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return bus.sync_read(data_name, num_retry=0)
+        except ConnectionError as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                delay = min(delay_between_attempts * (2 ** attempt), 1.0)
+                logging.warning(f"sync_read attempt {attempt + 1}/{max_attempts} failed, waiting {delay:.2f}s...")
+                time.sleep(delay)
+                try:
+                    if hasattr(bus, 'port_handler') and bus.port_handler is not None:
+                        bus.port_handler.clearPort()
+                        if attempt >= 4:
+                            logging.warning("Attempting USB port reconnection...")
+                            bus.port_handler.closePort()
+                            time.sleep(0.5)
+                            bus.port_handler.openPort()
+                            bus.port_handler.setBaudRate(bus.port_handler.getBaudRate())
+                except Exception as reconnect_err:
+                    logging.warning(f"Port recovery failed: {reconnect_err}")
+    raise last_error
+
+
+def _robust_sync_write(bus, data_name: str, values, max_attempts: int = 10, delay_between_attempts: float = 0.2):
+    """Robust sync_write with delays between retries and port recovery."""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return bus.sync_write(data_name, values, num_retry=0)
+        except ConnectionError as e:
+            last_error = e
+            if attempt < max_attempts - 1:
+                delay = min(delay_between_attempts * (2 ** attempt), 1.0)
+                logging.warning(f"sync_write attempt {attempt + 1}/{max_attempts} failed, waiting {delay:.2f}s...")
+                time.sleep(delay)
+                try:
+                    if hasattr(bus, 'port_handler') and bus.port_handler is not None:
+                        bus.port_handler.clearPort()
+                        if attempt >= 4:
+                            logging.warning("Attempting USB port reconnection...")
+                            bus.port_handler.closePort()
+                            time.sleep(0.5)
+                            bus.port_handler.openPort()
+                            bus.port_handler.setBaudRate(bus.port_handler.getBaudRate())
+                except Exception as reconnect_err:
+                    logging.warning(f"Port recovery failed: {reconnect_err}")
+    raise last_error
+
+
 def reset_follower_position(robot_arm, target_position):
-    current_position_dict = robot_arm.bus.sync_read("Present_Position")
+    current_position_dict = robot_arm.bus.sync_read("Present_Position", num_retry=3)
     current_position = np.array(
         [current_position_dict[name] for name in current_position_dict], dtype=np.float32
     )
+    logging.info(f"reset_follower_position: current={current_position}, target={target_position}")
     trajectory = torch.from_numpy(
-        np.linspace(current_position, target_position, 50)
-    )  # NOTE: 30 is just an arbitrary number
+        np.linspace(current_position, target_position, 150)
+    )
     for pose in trajectory:
         action_dict = dict(zip(current_position_dict, pose, strict=False))
-        robot_arm.bus.sync_write("Goal_Position", action_dict)
-        busy_wait(0.015)
+        robot_arm.bus.sync_write("Goal_Position", action_dict, num_retry=3)
+        busy_wait(0.025)
+    busy_wait(0.5)
+    final_pos_dict = robot_arm.bus.sync_read("Present_Position", num_retry=3)
+    final_pos = np.array([final_pos_dict[name] for name in final_pos_dict], dtype=np.float32)
+    logging.info(f"reset_follower_position: final={final_pos}, diff={np.abs(final_pos - target_position).max():.2f}")
+
+
+def reset_leader_position(leader_arm, target_position):
+    """Reset leader arm to match follower reset position."""
+    leader_arm.bus.sync_write("Torque_Enable", 1, num_retry=3)
+    busy_wait(0.1)
+
+    current_position_dict = leader_arm.bus.sync_read("Present_Position", num_retry=3)
+    current_position = np.array(
+        [current_position_dict[name] for name in current_position_dict], dtype=np.float32
+    )
+    logging.info(f"reset_leader_position: current={current_position}, target={target_position}")
+
+    trajectory = torch.from_numpy(
+        np.linspace(current_position, target_position, 100)
+    )
+    for pose in trajectory:
+        action_dict = dict(zip(current_position_dict, pose, strict=False))
+        leader_arm.bus.sync_write("Goal_Position", action_dict, num_retry=3)
+        busy_wait(0.02)
+    busy_wait(0.3)
+
+    leader_arm.bus.sync_write("Torque_Enable", 0, num_retry=3)
+
+    final_pos_dict = leader_arm.bus.sync_read("Present_Position", num_retry=3)
+    final_pos = np.array([final_pos_dict[name] for name in final_pos_dict], dtype=np.float32)
+    logging.info(f"reset_leader_position: final={final_pos}, diff={np.abs(final_pos - target_position).max():.2f}")
 
 
 class TorchBox(gym.spaces.Box):
@@ -248,6 +406,16 @@ class RobotEnv(gym.Env):
         # Connect to the robot if not already connected.
         if not self.robot.is_connected:
             self.robot.connect()
+
+        # Register atexit handler to disable torque on exit (handles crashes, Ctrl+C, etc.)
+        def _cleanup_torque():
+            try:
+                if hasattr(self.robot, 'bus') and self.robot.bus is not None:
+                    logging.info("[RobotEnv] atexit: Disabling motor torque...")
+                    self.robot.bus.sync_write("Torque_Enable", {name: False for name in self.robot.bus.motors})
+            except Exception as e:
+                logging.warning(f"[RobotEnv] atexit: Failed to disable torque: {e}")
+        atexit.register(_cleanup_torque)
 
         # Episode tracking.
         self.current_step = 0
@@ -690,6 +858,7 @@ class ImageCropResizeWrapper(gym.Wrapper):
         env,
         crop_params_dict: dict[str, Annotated[tuple[int], 4]],
         resize_size=None,
+        normalize_images: bool = True,
     ):
         """
         Initialize the image crop and resize wrapper.
@@ -699,10 +868,13 @@ class ImageCropResizeWrapper(gym.Wrapper):
             crop_params_dict: Dictionary mapping image observation keys to crop parameters
                              (top, left, height, width).
             resize_size: Target size for resized images (height, width). Defaults to (128, 128).
+            normalize_images: If True, images are [0, 1]. If False, images are [0, 255].
         """
         super().__init__(env)
         self.env = env
         self.crop_params_dict = crop_params_dict
+        self.normalize_images = normalize_images
+        self.clamp_max = 1.0 if normalize_images else 255.0
         print(f"obs_keys , {self.env.observation_space}")
         print(f"crop params dict {crop_params_dict.keys()}")
         for key_crop in crop_params_dict:
@@ -710,7 +882,8 @@ class ImageCropResizeWrapper(gym.Wrapper):
                 raise ValueError(f"Key {key_crop} not in observation space")
         for key in crop_params_dict:
             new_shape = (3, resize_size[0], resize_size[1])
-            self.observation_space[key] = gym.spaces.Box(low=0, high=255, shape=new_shape)
+            high = 1.0 if normalize_images else 255.0
+            self.observation_space[key] = gym.spaces.Box(low=0, high=high, shape=new_shape)
 
         self.resize_size = resize_size
         if self.resize_size is None:
@@ -750,7 +923,7 @@ class ImageCropResizeWrapper(gym.Wrapper):
             obs[k] = F.crop(obs[k], *self.crop_params_dict[k])
             obs[k] = F.resize(obs[k], self.resize_size)
             # TODO (michel-aractingi): Bug in resize, it returns values outside [0, 1]
-            obs[k] = obs[k].clamp(0.0, 1.0)
+            obs[k] = obs[k].clamp(0.0, self.clamp_max)
             obs[k] = obs[k].to(device)
 
         return obs, reward, terminated, truncated, info
@@ -773,7 +946,7 @@ class ImageCropResizeWrapper(gym.Wrapper):
                 obs[k] = obs[k].cpu()
             obs[k] = F.crop(obs[k], *self.crop_params_dict[k])
             obs[k] = F.resize(obs[k], self.resize_size)
-            obs[k] = obs[k].clamp(0.0, 1.0)
+            obs[k] = obs[k].clamp(0.0, self.clamp_max)
             obs[k] = obs[k].to(device)
         return obs, info
 
@@ -836,6 +1009,7 @@ class ResetWrapper(gym.Wrapper):
 
     This wrapper provides additional functionality during environment reset,
     including the option to reset to a fixed pose or allow manual reset.
+    Supports IK-based reset using placo for precise EE positioning.
     """
 
     def __init__(
@@ -843,66 +1017,232 @@ class ResetWrapper(gym.Wrapper):
         env: RobotEnv,
         reset_pose: np.ndarray | None = None,
         reset_time_s: float = 5,
+        use_ik_reset: bool = False,
+        ik_reset_ee_pos: list | None = None,
+        reset_delay_s: float = 0.0,
+        capture_home_on_start: bool = False,
+        random_ee_reset: bool = False,
+        random_ee_range_xy: float = 0.03,
+        random_ee_range_z: float = 0.02,
     ):
-        """
-        Initialize the reset wrapper.
-
-        Args:
-            env: The environment to wrap.
-            reset_pose: Fixed joint positions to reset to. If None, manual reset is used.
-            reset_time_s: Time in seconds to wait after reset or allowed for manual reset.
-        """
         super().__init__(env)
         self.reset_time_s = reset_time_s
         self.reset_pose = reset_pose
         self.robot = self.unwrapped.robot
+        self.use_ik_reset = use_ik_reset
+        self.ik_reset_ee_pos = np.array(ik_reset_ee_pos) if ik_reset_ee_pos else np.array([0.25, -0.015, 0.05])
+        self.reset_delay_s = reset_delay_s
+        self.capture_home_on_start = capture_home_on_start
+        self.random_ee_reset = random_ee_reset
+        self.random_ee_range_xy = random_ee_range_xy
+        self.random_ee_range_z = random_ee_range_z
+
+        # Initialize placo kinematics for IK reset if robot has URDF config
+        self._kinematics = None
+        if self.use_ik_reset and hasattr(self.robot.config, 'urdf_path') and self.robot.config.urdf_path:
+            self._kinematics = RobotKinematics(
+                urdf_path=self.robot.config.urdf_path,
+                target_frame_name=self.robot.config.target_frame_name,
+            )
 
     def reset(self, *, seed=None, options=None):
-        """
-        Reset the environment with either fixed or manual reset procedure.
-
-        If reset_pose is provided, the robot will move to that position.
-        Otherwise, manual teleoperation control is allowed for reset_time_s seconds.
-
-        Args:
-            seed: Random seed for reproducibility.
-            options: Additional reset options.
-
-        Returns:
-            The initial observation and info from the wrapped environment.
-        """
         start_time = time.perf_counter()
-        if self.reset_pose is not None:
-            log_say("Reset the environment.", play_sounds=True)
+
+        if self.use_ik_reset and self._kinematics is not None:
+            # ================================================================
+            # THREE-STEP IK RESET using placo (URDF-based FK/IK)
+            # Step 1: Move to SAFE_JOINTS (all zeros) - extended forward position
+            # Step 2: Set wrist to top-down orientation (90°)
+            # Step 3: Move ABOVE target EE via closed-loop IK
+            # Step 4: Lower to target EE position
+            #
+            # placo works in DEGREES natively — no rad/deg conversion needed.
+            # ================================================================
+            logging.info(f"IK reset to EE target: {self.ik_reset_ee_pos}")
+
+            torque_status = self.robot.bus.sync_read("Torque_Enable", num_retry=3)
+            logging.info(f"Motor torque status: {torque_status}")
+
+            # STEP 1: Move to SAFE_JOINTS (all zeros)
+            logging.info("IK reset step 1: Moving to SAFE_JOINTS (all zeros)")
+            safe_joints_deg = np.array([0.0, 0.0, 0.0, 0.0, 0.0])
+            safe_joints_deg = _clamp_degrees(safe_joints_deg)
+
+            action_dict = {name: safe_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
+            action_dict["gripper"] = 50.0
+            logging.info(f"Step 1 sending: {action_dict}")
+            self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
+            busy_wait(1.5)
+
+            pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
+            logging.info(f"Step 1 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
+
+            # STEP 2: Set wrist to top-down orientation
+            logging.info("IK reset step 2: Setting wrist to top-down orientation (90°)")
+            topdown_joints_deg = np.array([pos_dict[name] for name in _IK_MOTOR_NAMES])
+
+            # Use locked_joint_positions from config if available, else default to 90°
+            locked_positions = getattr(self.robot.config, 'locked_joint_positions', None)
+            if locked_positions:
+                topdown_joints_deg[3] = float(locked_positions.get("3", locked_positions.get(3, 90.0)))
+                topdown_joints_deg[4] = float(locked_positions.get("4", locked_positions.get(4, 90.0)))
+            else:
+                topdown_joints_deg[3] = 90.0  # wrist_flex
+                topdown_joints_deg[4] = 90.0  # wrist_roll
+            topdown_joints_deg = _clamp_degrees(topdown_joints_deg)
+
+            action_dict = {name: topdown_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
+            action_dict["gripper"] = 50.0
+            logging.info(f"Step 2 sending: {action_dict}")
+            self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
+            busy_wait(1.0)
+
+            pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
+            logging.info(f"Step 2 reached: {[f'{pos_dict[n]:.1f}' for n in _IK_MOTOR_NAMES]}")
+
+            # Compute reset target (with optional random offset)
+            if self.random_ee_reset:
+                offset_xy = np.array([
+                    np.random.uniform(-self.random_ee_range_xy, self.random_ee_range_xy),
+                    np.random.uniform(-self.random_ee_range_xy, self.random_ee_range_xy),
+                ])
+                reset_target_ee = self.ik_reset_ee_pos.copy()
+                reset_target_ee[0] += offset_xy[0]
+                reset_target_ee[1] += offset_xy[1]
+                logging.info(f"Random EE reset: base={self.ik_reset_ee_pos}, offset_xy={offset_xy}, target={reset_target_ee}")
+            else:
+                reset_target_ee = self.ik_reset_ee_pos.copy()
+
+            # STEP 3 & 4: Move above target, then lower to target
+            HEIGHT_OFFSET = 0.07  # 7cm above target for approach
+            above_target = reset_target_ee.copy()
+            above_target[2] += HEIGHT_OFFSET
+            ik_targets = [
+                ("Step 3 (above)", above_target),
+                ("Step 4 (lower)", reset_target_ee),
+            ]
+
+            for step_name, ik_target in ik_targets:
+                logging.info(f"IK reset {step_name}: Moving to EE target {ik_target}")
+                ik_converged = False
+                prev_error = float('inf')
+                stuck_count = 0
+                error = float('inf')
+
+                for ik_step in range(50):
+                    # 1. Read actual robot position (degrees)
+                    current_pos_dict = self.robot.bus.sync_read("Present_Position", num_retry=3)
+                    current_joints_deg = np.array([current_pos_dict[name] for name in _IK_MOTOR_NAMES])
+
+                    # 2. FK via placo to get current EE position (placo works in degrees)
+                    current_ee_pose = self._kinematics.forward_kinematics(current_joints_deg)
+                    current_ee = current_ee_pose[:3, 3]
+                    error = np.linalg.norm(ik_target - current_ee)
+
+                    if ik_step == 0:
+                        logging.info(f"{step_name} start: EE={current_ee}, error={error:.4f}m")
+
+                    # Converged within 1.5cm
+                    if error < 0.015:
+                        logging.info(f"{step_name} converged at step {ik_step}, error={error:.4f}m")
+                        ik_converged = True
+                        break
+
+                    # Detect if stuck (error not improving)
+                    if abs(error - prev_error) < 0.0005:
+                        stuck_count += 1
+                        if stuck_count >= 3:
+                            logging.info(f"{step_name} done (stuck), step {ik_step}, error={error:.4f}m")
+                            ik_converged = error < 0.025
+                            break
+                    else:
+                        stuck_count = 0
+                    prev_error = error
+
+                    # 3. Build desired 4x4 pose and compute IK via placo
+                    desired_ee_pose = current_ee_pose.copy()
+                    desired_ee_pose[:3, 3] = ik_target
+                    target_joints_deg = self._kinematics.inverse_kinematics(current_joints_deg, desired_ee_pose)
+
+                    # 4. Clamp delta to max 10° per step so motors can keep up
+                    delta_deg = target_joints_deg - current_joints_deg
+                    max_delta = 10.0
+                    delta_deg = np.clip(delta_deg, -max_delta, max_delta)
+                    target_joints_deg = current_joints_deg + delta_deg
+
+                    # 5. Clamp to valid encoder range
+                    target_joints_deg = _clamp_degrees(target_joints_deg)
+
+                    # 6. Build action dict and send
+                    gripper_pos = current_pos_dict.get("gripper", 50.0)
+                    action_dict = {name: target_joints_deg[i] for i, name in enumerate(_IK_MOTOR_NAMES)}
+                    action_dict["gripper"] = gripper_pos
+
+                    if ik_step % 10 == 0:
+                        logging.info(f"{step_name} iter {ik_step}: error={error:.4f}m, EE={current_ee}")
+
+                    self.robot.bus.sync_write("Goal_Position", action_dict, num_retry=3)
+                    busy_wait(0.1)
+
+                if not ik_converged:
+                    logging.warning(f"{step_name} did not fully converge, final error={error:.4f}m")
+
+            logging.info("IK reset complete")
+
+            # Reset leader arm to match follower position
+            if hasattr(self.env, "robot_leader"):
+                follower_pos = self.robot.bus.sync_read("Present_Position", num_retry=3)
+                follower_pos_arr = np.array([follower_pos[name] for name in follower_pos], dtype=np.float32)
+                reset_leader_position(self.env.robot_leader, follower_pos_arr)
+                logging.info("Leader arm synced to follower position")
+
+            # Wait for user to reposition objects if delay configured
+            if self.reset_delay_s > 0:
+                log_say(f"Place cube. {int(self.reset_delay_s)} seconds.", play_sounds=False)
+                logging.info(f"Waiting {self.reset_delay_s}s for object repositioning...")
+                time.sleep(self.reset_delay_s)
+
+            # Disable leader torque so user can teleoperate freely
+            if hasattr(self.env, "robot_leader"):
+                self.env.robot_leader.bus.sync_write("Torque_Enable", 0, num_retry=3)
+                logging.info("Leader torque disabled for teleoperation")
+
+            log_say("Episode starting", play_sounds=False)
+
+            return super().reset(seed=seed, options=options)
+
+        if self.capture_home_on_start:
+            logging.info("Using current position as home (no reset motion)")
+        elif self.reset_pose is not None:
+            log_say(f"Resetting. {int(self.reset_time_s)} seconds.", play_sounds=False)
             reset_follower_position(self.unwrapped.robot, self.reset_pose)
-            log_say("Reset the environment done.", play_sounds=True)
 
             if hasattr(self.env, "robot_leader"):
-                self.env.robot_leader.bus.sync_write("Torque_Enable", 1)
-                log_say("Reset the leader robot.", play_sounds=True)
-                reset_follower_position(self.env.robot_leader, self.reset_pose)
-                log_say("Reset the leader robot done.", play_sounds=True)
+                reset_leader_position(self.env.robot_leader, self.reset_pose)
+
+            busy_wait(self.reset_time_s)
+            log_say("Reset done.", play_sounds=False)
         else:
             log_say(
-                f"Manually reset the environment for {self.reset_time_s} seconds.",
-                play_sounds=True,
+                f"Reset environment. {int(self.reset_time_s)} seconds.",
+                play_sounds=False,
             )
             start_time = time.perf_counter()
             while time.perf_counter() - start_time < self.reset_time_s:
                 # For SO-101 without URDF, directly mirror leader joint positions
                 if hasattr(self.env, 'robot_leader') and not hasattr(self.unwrapped.robot.config, 'urdf_path'):
-                    # Read leader positions and mirror to follower
-                    leader_pos_dict = self.env.robot_leader.bus.sync_read("Present_Position")
+                    leader_pos_dict = self.env.robot_leader.bus.sync_read("Present_Position", num_retry=3)
                     joint_action = {f"{name}.pos": pos for name, pos in leader_pos_dict.items()}
                     self.unwrapped.robot.send_action(joint_action)
                 else:
-                    # Use normal action pipeline for URDF-based robots
                     action = self.env.robot_leader.get_action()
                     self.unwrapped.robot.send_action(action)
 
-            log_say("Manual reset of the environment done.", play_sounds=True)
+            log_say("Reset done.", play_sounds=False)
 
         busy_wait(self.reset_time_s - (time.perf_counter() - start_time))
+
+        log_say("Episode starting", play_sounds=False)
 
         return super().reset(seed=seed, options=options)
 
@@ -1066,9 +1406,11 @@ class GripperActionWrapper(gym.ActionWrapper):
                 self.last_gripper_action = action[-1]
 
         gripper_command = action[-1]
-        # Gripper actions are between 0, 2
-        # we want to quantize them to -1, 0 or 1
-        gripper_command = gripper_command - 1.0
+        # Gripper actions from policy are in [-1, 1] (tanh output)
+        # -1 = close, 0 = no change, 1 = open
+        # Handle legacy [0, 2] format from action_space.sample() by converting to [-1, 1]
+        if gripper_command > 1.0:
+            gripper_command = gripper_command - 1.0  # [0, 2] -> [-1, 1]
 
         if self.quantization_threshold is not None:
             # Quantize gripper command to -1, 0 or 1
@@ -1078,7 +1420,7 @@ class GripperActionWrapper(gym.ActionWrapper):
         max_gripper_pos = getattr(self.unwrapped.robot.config, 'max_gripper_pos', 100)
         gripper_command = gripper_command * max_gripper_pos
 
-        gripper_state = self.unwrapped.robot.bus.sync_read("Present_Position")["gripper"]
+        gripper_state = self.unwrapped.robot.bus.sync_read("Present_Position", num_retry=3)["gripper"]
 
         gripper_action_value = np.clip(
             gripper_state + gripper_command, 0, max_gripper_pos
@@ -1477,11 +1819,11 @@ class GearedLeaderControlWrapper(BaseLeaderControlWrapper):
                     "Place the leader in similar pose to the follower and press space again."
                 )
                 self.keyboard_events["human_intervention_step"] = True
-                log_say("Human intervention step.", play_sounds=True)
+                log_say("Human intervention step.", play_sounds=False)
             else:
                 self.keyboard_events["human_intervention_step"] = False
                 logging.info("Space key pressed for a second time.\nContinuing with policy actions.")
-                log_say("Continuing with policy actions.", play_sounds=True)
+                log_say("Continuing with policy actions.", play_sounds=False)
 
     def _check_intervention(self):
         """
@@ -1552,7 +1894,7 @@ class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
         ):
             self.is_intervention_active = True
             self.leader_tracking_error_queue.clear()
-            log_say("Intervention started", play_sounds=True)
+            log_say("Intervention started", play_sounds=False)
             return True
 
         # Track the error over time in leader_tracking_error_queue
@@ -1564,7 +1906,7 @@ class GearedLeaderAutomaticControlWrapper(BaseLeaderControlWrapper):
         ):
             self.is_intervention_active = False
             self.leader_tracking_error_queue.clear()
-            log_say("Intervention ended", play_sounds=True)
+            log_say("Intervention ended", play_sounds=False)
             return False
 
         # If not change has happened that merits a change in the intervention state, return the current state
@@ -1954,11 +2296,14 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
 
     env = ConvertToLeRobotObservation(env=env, device=cfg.device)
 
+    normalize_images = cfg.wrapper.normalize_images if cfg.wrapper else True
+
     if cfg.wrapper and cfg.wrapper.crop_params_dict is not None:
         env = ImageCropResizeWrapper(
             env=env,
             crop_params_dict=cfg.wrapper.crop_params_dict,
             resize_size=cfg.wrapper.resize_size,
+            normalize_images=normalize_images,
         )
 
     # Add reward computation and control wrappers
@@ -2020,10 +2365,25 @@ def make_robot_env(cfg: EnvConfig) -> gym.Env:
     else:
         raise ValueError(f"Invalid control mode: {control_mode}")
 
+    use_ik_reset = getattr(cfg.wrapper, 'use_ik_reset', False)
+    ik_reset_ee_pos = getattr(cfg.wrapper, 'ik_reset_ee_pos', None)
+    reset_delay_s = getattr(cfg.wrapper, 'reset_delay_s', 0.0)
+    capture_home_on_start = getattr(cfg.wrapper, 'capture_home_on_start', False)
+    random_ee_reset = getattr(cfg.wrapper, 'random_ee_reset', False)
+    random_ee_range_xy = getattr(cfg.wrapper, 'random_ee_range_xy', 0.03)
+    random_ee_range_z = getattr(cfg.wrapper, 'random_ee_range_z', 0.02)
+
     env = ResetWrapper(
         env=env,
         reset_pose=cfg.wrapper.fixed_reset_joint_positions,
         reset_time_s=cfg.wrapper.reset_time_s,
+        use_ik_reset=use_ik_reset,
+        ik_reset_ee_pos=ik_reset_ee_pos,
+        reset_delay_s=reset_delay_s,
+        capture_home_on_start=capture_home_on_start,
+        random_ee_reset=random_ee_reset,
+        random_ee_range_xy=random_ee_range_xy,
+        random_ee_range_z=random_ee_range_z,
     )
 
     env = BatchCompatibleWrapper(env=env)
@@ -2144,7 +2504,7 @@ def record_dataset(env, policy, cfg):
     while episode_index < cfg.num_episodes:
         obs, _ = env.reset()
         start_episode_t = time.perf_counter()
-        log_say(f"Recording episode {episode_index}", play_sounds=True)
+        log_say(f"Recording episode {episode_index}", play_sounds=False)
 
         # Track success state collection
         success_detected = False

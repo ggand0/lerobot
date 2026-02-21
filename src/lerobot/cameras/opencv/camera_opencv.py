@@ -123,6 +123,7 @@ class OpenCVCamera(Camera):
         self.frame_lock: Lock = Lock()
         self.latest_frame: np.ndarray | None = None
         self.new_frame_event: Event = Event()
+        self.last_successful_read: float = 0.0  # Watchdog: track last successful read time
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
         self.backend: int = get_cv2_backend()
@@ -140,12 +141,53 @@ class OpenCVCamera(Camera):
         """Checks if the camera is currently connected and opened."""
         return isinstance(self.videocapture, cv2.VideoCapture) and self.videocapture.isOpened()
 
+    def _try_open_camera(self, device_path: str | int) -> bool:
+        """Try to open a camera device and verify it can read valid frames."""
+        try:
+            cap = cv2.VideoCapture(device_path, self.backend)
+            if not cap.isOpened():
+                cap.release()
+                return False
+            # Try to read multiple frames to ensure stability (metadata devices often fail)
+            for _ in range(3):
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    cap.release()
+                    return False
+                # Check frame has valid dimensions (metadata devices return empty/tiny frames)
+                if frame.shape[0] < 100 or frame.shape[1] < 100:
+                    cap.release()
+                    return False
+                time.sleep(0.05)
+            cap.release()
+            return True
+        except Exception:
+            return False
+
+    def _find_working_camera(self) -> str | None:
+        """Scan /dev/video* devices and return the first one that works.
+
+        Skips metadata devices by checking for valid frame reads.
+        USB cameras typically have pairs: video0 (camera) + video1 (metadata).
+        """
+        import glob
+        video_devices = sorted(glob.glob("/dev/video*"))
+        for device in video_devices:
+            logger.info(f"Trying camera device: {device}")
+            if self._try_open_camera(device):
+                logger.info(f"Found working camera: {device}")
+                return device
+            else:
+                logger.info(f"Skipping {device} (metadata or non-functional)")
+        return None
+
     def connect(self, warmup: bool = True):
         """
         Connects to the OpenCV camera specified in the configuration.
 
         Initializes the OpenCV VideoCapture object, sets desired camera properties
-        (FPS, width, height), and performs initial checks.
+        (FPS, width, height), and performs initial checks. If the specified device
+        fails, automatically scans for working camera devices.
 
         Raises:
             DeviceAlreadyConnectedError: If the camera is already connected.
@@ -161,11 +203,34 @@ class OpenCVCamera(Camera):
 
         self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
 
+        # Use MJPG format and small buffer to reduce USB bandwidth and latency
+        if self.videocapture.isOpened():
+            self.videocapture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            self.videocapture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not self.videocapture.isOpened():
+            self.videocapture.release()
+            self.videocapture = None
+            # Try auto-detection
+            logger.warning(f"Failed to open {self.index_or_path}, scanning for available cameras...")
+            working_device = self._find_working_camera()
+            if working_device:
+                logger.info(f"Auto-detected camera: {working_device}")
+                self.index_or_path = working_device
+                self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+                self.videocapture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                self.videocapture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            else:
+                raise ConnectionError(
+                    f"Failed to open {self} and no working cameras found. "
+                    f"Run `python -m lerobot.find_cameras opencv` to find available cameras."
+                )
+
         if not self.videocapture.isOpened():
             self.videocapture.release()
             self.videocapture = None
             raise ConnectionError(
-                f"Failed to open {self}."
+                f"Failed to open {self}. "
                 f"Run `python -m lerobot.find_cameras opencv` to find available cameras."
             )
 
@@ -220,28 +285,31 @@ class OpenCVCamera(Camera):
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
 
-        success = self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
+        self.videocapture.set(cv2.CAP_PROP_FPS, float(self.fps))
         actual_fps = self.videocapture.get(cv2.CAP_PROP_FPS)
-        # Use math.isclose for robust float comparison
-        if not success or not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
+        # Use math.isclose for robust float comparison (ignore success flag — some
+        # cameras return False from set() but still report the correct fps)
+        if not math.isclose(self.fps, actual_fps, rel_tol=1e-3):
             raise RuntimeError(f"{self} failed to set fps={self.fps} ({actual_fps=}).")
 
     def _validate_width_and_height(self) -> None:
         """Validates and sets the camera's frame capture width and height."""
 
-        width_success = self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
-        height_success = self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
+        self.videocapture.set(cv2.CAP_PROP_FRAME_WIDTH, float(self.capture_width))
+        self.videocapture.set(cv2.CAP_PROP_FRAME_HEIGHT, float(self.capture_height))
 
+        # Ignore success flag — some V4L2 drivers return False even when the
+        # setting is applied correctly. Only check the actual reported values.
         actual_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
-        if not width_success or self.capture_width != actual_width:
+        if self.capture_width != actual_width:
             raise RuntimeError(
-                f"{self} failed to set capture_width={self.capture_width} ({actual_width=}, {width_success=})."
+                f"{self} failed to set capture_width={self.capture_width} ({actual_width=})."
             )
 
         actual_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-        if not height_success or self.capture_height != actual_height:
+        if self.capture_height != actual_height:
             raise RuntimeError(
-                f"{self} failed to set capture_height={self.capture_height} ({actual_height=}, {height_success=})."
+                f"{self} failed to set capture_height={self.capture_height} ({actual_height=})."
             )
 
     @staticmethod
@@ -384,18 +452,40 @@ class OpenCVCamera(Camera):
 
         Stops on DeviceNotConnectedError, logs other errors and continues.
         """
+        consecutive_failures = 0
+        max_failures = 10
         while not self.stop_event.is_set():
             try:
                 color_image = self.read()
 
                 with self.frame_lock:
                     self.latest_frame = color_image
+                    self.last_successful_read = time.perf_counter()
                 self.new_frame_event.set()
+                consecutive_failures = 0
 
             except DeviceNotConnectedError:
                 break
             except Exception as e:
-                logger.warning(f"Error reading frame in background thread for {self}: {e}")
+                consecutive_failures += 1
+                if consecutive_failures >= max_failures:
+                    logger.warning(f"{self}: {consecutive_failures} consecutive read failures, attempting reconnect...")
+                    try:
+                        if self.videocapture is not None:
+                            self.videocapture.release()
+                        working_device = self._find_working_camera()
+                        if working_device:
+                            logger.info(f"{self}: Reconnected to {working_device}")
+                            self.index_or_path = working_device
+                            self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+                            self._configure_capture_settings()
+                            consecutive_failures = 0
+                        else:
+                            logger.error(f"{self}: No working camera found")
+                    except Exception as reconnect_error:
+                        logger.error(f"{self}: Reconnect failed: {reconnect_error}")
+                else:
+                    logger.warning(f"Error reading frame in background thread for {self}: {e}")
 
     def _start_read_thread(self) -> None:
         """Starts or restarts the background read thread if it's not running."""
@@ -419,6 +509,38 @@ class OpenCVCamera(Camera):
 
         self.thread = None
         self.stop_event = None
+
+    def _force_reconnect(self) -> None:
+        """Force reconnect when background thread is stuck on read()."""
+        logger.warning(f"{self}: Force reconnecting camera...")
+
+        # Signal thread to stop (it may be stuck, so don't wait long)
+        if self.stop_event is not None:
+            self.stop_event.set()
+
+        # Release videocapture to unblock stuck read()
+        if self.videocapture is not None:
+            self.videocapture.release()
+            self.videocapture = None
+
+        # Brief wait for thread to notice
+        if self.thread is not None:
+            self.thread.join(timeout=0.5)
+
+        self.thread = None
+        self.stop_event = None
+
+        # Find and reconnect to working camera
+        working_device = self._find_working_camera()
+        if working_device:
+            logger.info(f"{self}: Reconnected to {working_device}")
+            self.index_or_path = working_device
+            self.videocapture = cv2.VideoCapture(self.index_or_path, self.backend)
+            self._configure_capture_settings()
+            self.last_successful_read = 0.0
+            self._start_read_thread()
+        else:
+            logger.error(f"{self}: No working camera found during force reconnect")
 
     def async_read(self, timeout_ms: float = 200) -> np.ndarray:
         """
@@ -449,6 +571,21 @@ class OpenCVCamera(Camera):
 
         if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
             thread_alive = self.thread is not None and self.thread.is_alive()
+
+            # Watchdog: if thread is alive but stuck on read() for > 0.5 seconds, force reconnect
+            if thread_alive and self.last_successful_read > 0:
+                time_since_last_read = time.perf_counter() - self.last_successful_read
+                if time_since_last_read > 0.5:
+                    logger.warning(f"{self}: Thread stuck for {time_since_last_read:.1f}s, forcing reconnect...")
+                    self._force_reconnect()
+                    # Try once more after reconnect
+                    if self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+                        with self.frame_lock:
+                            frame = self.latest_frame
+                            self.new_frame_event.clear()
+                        if frame is not None:
+                            return frame
+
             raise TimeoutError(
                 f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
                 f"Read thread alive: {thread_alive}."
