@@ -116,6 +116,14 @@ def train(cfg: TrainPipelineConfig):
         wandb_logger = None
         logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
+    tb_writer = None
+    if cfg.tensorboard.enable:
+        from torch.utils.tensorboard import SummaryWriter
+
+        tb_log_dir = cfg.output_dir / "tensorboard"
+        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
+        logging.info(colored(f"TensorBoard logging to {tb_log_dir}", "yellow", attrs=["bold"]))
+
     if cfg.seed is not None:
         set_seed(cfg.seed)
 
@@ -239,6 +247,13 @@ def train(cfg: TrainPipelineConfig):
                 if output_dict:
                     wandb_log_dict.update(output_dict)
                 wandb_logger.log_dict(wandb_log_dict, step)
+            if tb_writer:
+                tb_log_dict = train_tracker.to_dict()
+                if output_dict:
+                    tb_log_dict.update(output_dict)
+                for key, value in tb_log_dict.items():
+                    if isinstance(value, (int, float)):
+                        tb_writer.add_scalar(f"train/{key}", value, step)
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
@@ -281,9 +296,15 @@ def train(cfg: TrainPipelineConfig):
                 wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
                 wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
                 wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
+            if tb_writer:
+                for key, value in eval_tracker.to_dict().items():
+                    if isinstance(value, (int, float)):
+                        tb_writer.add_scalar(f"eval/{key}", value, step)
 
     if eval_env:
         eval_env.close()
+    if tb_writer:
+        tb_writer.close()
     logging.info("End of training")
 
     if cfg.policy.push_to_hub:
