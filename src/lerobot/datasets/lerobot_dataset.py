@@ -485,6 +485,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self.episode_data_index = get_episode_data_index(self.meta.episodes, self.episodes)
 
+        # Build mapping from original episode index to positional index in episode_data_index.
+        # When episodes are filtered (e.g. [0,1,3,5,...]), the data rows retain their original
+        # episode_index values, but episode_data_index is indexed positionally (0..N-1).
+        if self.episodes is not None:
+            self._ep_idx_map = {ep: i for i, ep in enumerate(self.episodes)}
+        else:
+            self._ep_idx_map = None
+
         # Check timestamps
         timestamps = torch.stack(self.hf_dataset["timestamp"]).numpy()
         episode_indices = torch.stack(self.hf_dataset["episode_index"]).numpy()
@@ -706,9 +714,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
 
+        # Map original episode index to positional index for episode_data_index lookups
+        pos_idx = self._ep_idx_map[ep_idx] if self._ep_idx_map is not None else ep_idx
+
         query_indices = None
         if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            query_indices, padding = self._get_query_indices(idx, pos_idx)
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():
