@@ -19,6 +19,8 @@ import time
 from functools import cached_property
 from typing import Any
 
+import numpy as np
+
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
@@ -66,9 +68,13 @@ class SO101Follower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
-        }
+        features = {}
+        for cam in self.cameras:
+            cam_config = self.config.cameras[cam]
+            features[cam] = (cam_config.height, cam_config.width, 3)
+            if getattr(cam_config, "use_depth", False):
+                features[f"depth_{cam}"] = (cam_config.height, cam_config.width, 1)
+        return features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -180,6 +186,13 @@ class SO101Follower(Robot):
             obs_dict[cam_key] = cam.async_read()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+            if getattr(cam, "use_depth", False):
+                start = time.perf_counter()
+                depth = cam.async_read_depth()
+                obs_dict[f"depth_{cam_key}"] = depth[..., np.newaxis]  # (H, W) → (H, W, 1)
+                dt_ms = (time.perf_counter() - start) * 1e3
+                logger.debug(f"{self} read depth_{cam_key}: {dt_ms:.1f}ms")
 
         return obs_dict
 

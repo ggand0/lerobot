@@ -18,6 +18,7 @@ import queue
 import threading
 from pathlib import Path
 
+import cv2
 import numpy as np
 import PIL.Image
 import torch
@@ -75,14 +76,20 @@ def image_array_to_pil_image(image_array: np.ndarray, range_check: bool = True) 
 
 def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path):
     try:
-        if isinstance(image, np.ndarray):
+        if isinstance(image, np.ndarray) and image.dtype == np.uint16:
+            # Depth image: save as 16-bit PNG via cv2 (PIL's uint16 support is unreliable)
+            depth = image.squeeze() if image.ndim == 3 else image  # (H, W, 1) → (H, W)
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(fpath), depth)
+        elif isinstance(image, np.ndarray):
             img = image_array_to_pil_image(image)
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            img.save(fpath)
         elif isinstance(image, PIL.Image.Image):
-            img = image
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            image.save(fpath)
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
-        fpath.parent.mkdir(parents=True, exist_ok=True)
-        img.save(fpath)
     except Exception as e:
         print(f"Error writing image {fpath}: {e}")
 

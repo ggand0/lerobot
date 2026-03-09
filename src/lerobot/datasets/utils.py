@@ -414,8 +414,11 @@ def hw_to_dataset_features(
         }
 
     for key, shape in cam_fts.items():
+        # Depth features are always stored as individual PNGs (never video-encoded,
+        # since video codecs are 8-bit lossy and would destroy 16-bit depth precision)
+        is_depth = key.startswith("depth_")
         features[f"{prefix}.images.{key}"] = {
-            "dtype": "video" if use_video else "image",
+            "dtype": "image" if is_depth else ("video" if use_video else "image"),
             "shape": shape,
             "names": ["height", "width", "channels"],
         }
